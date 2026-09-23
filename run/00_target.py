@@ -30,10 +30,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from metamon.config import Config
-from metamon.data import Splits, attach, build_queries, instruction, save_dataset
-from metamon.modeling import load_tokenizer
-from metamon.target import ResponseCache, build_target
+from Pipeline.config import Config
+from Pipeline.data import Splits, attach, build_queries, instruction, save_dataset
+from Pipeline.modeling import load_tokenizer
+from Pipeline.target import ResponseCache, build_target
 
 
 def main() -> None:

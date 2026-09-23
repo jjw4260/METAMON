@@ -29,20 +29,20 @@ Neural-surrogates.
 
 | 파트 | 내용 | 대응 수식 |
 |---|---|---|
-| `metamon/config.py` | 하이퍼파라미터, 설정 해시 관문 | - |
-| `metamon/target.py` | Target Model(victim) 질의, 캐시, 질의 예산 | `theta_Target`, `y_Target` |
-| `metamon/data.py` | 질의 구성, Target 응답 부착, 분할, 중복 검사 | `X`, `Y_Target` |
-| `metamon/modeling.py` | 모델 1 인스턴스, 7 종 역할 가중치 공간 | `rho` 정의 |
-| `metamon/metrics.py` | 지표와 통계 | `eq:mean_log_probability`, `eq:sim`, `eq:single_fidelity`, `eq:weighted_loss`, `eq:soft_weight`, `eq:single_dependency` |
-| `metamon/lord.py` | LoRD 학습 | LoRD Eq.8-11 |
-| `metamon/sft.py` | 대조군 fleet | - |
-| `metamon/fleet.py` | fleet 준비, 생존 관문, 복원 검증 | `eq:local_update` |
-| `metamon/weightspace.py` | 공통 가중치 공간, 다양성 관문 | `eq:norm_matching` (수정판) |
-| `metamon/contribution.py` | 기여도와 선택 | `eq:perturbed_loss`, `eq:partial_score`, `eq:layer_selection`, `eq:representative_update`, `eq:assembly_verification` |
-| `metamon/aggregate.py` | 조립 방식과 대조군 | - |
-| `metamon/evaluate.py` | 배율(check), 최종 비교(test) | - |
-| `metamon/dependency.py` | 종속성 세 집합, 앙상블 baseline | `eq:single_dependency`, `eq:dependency_mitigation` |
-| `metamon/textgen.py` | 생성, BLEU / ROUGE-L / BERTScore, 비용표 | - |
+| `Pipeline/config.py` | 하이퍼파라미터, 설정 해시 관문 | - |
+| `Pipeline/target.py` | Target Model(victim) 질의, 캐시, 질의 예산 | `theta_Target`, `y_Target` |
+| `Pipeline/data.py` | 질의 구성, Target 응답 부착, 분할, 중복 검사 | `X`, `Y_Target` |
+| `Pipeline/modeling.py` | 모델 1 인스턴스, 7 종 역할 가중치 공간 | `rho` 정의 |
+| `Pipeline/metrics.py` | 지표와 통계 | `eq:mean_log_probability`, `eq:sim`, `eq:single_fidelity`, `eq:weighted_loss`, `eq:soft_weight`, `eq:single_dependency` |
+| `Pipeline/lord.py` | LoRD 학습 | LoRD Eq.8-11 |
+| `Pipeline/sft.py` | 대조군 fleet | - |
+| `Pipeline/fleet.py` | fleet 준비, 생존 관문, 복원 검증 | `eq:local_update` |
+| `Pipeline/weightspace.py` | 공통 가중치 공간, 다양성 관문 | `eq:norm_matching` (수정판) |
+| `Pipeline/contribution.py` | 기여도와 선택 | `eq:perturbed_loss`, `eq:partial_score`, `eq:layer_selection`, `eq:representative_update`, `eq:assembly_verification` |
+| `Pipeline/aggregate.py` | 조립 방식과 대조군 | - |
+| `Pipeline/evaluate.py` | 배율(check), 최종 비교(test) | - |
+| `Pipeline/dependency.py` | 종속성 세 집합, 앙상블 baseline | `eq:single_dependency`, `eq:dependency_mitigation` |
+| `Pipeline/textgen.py` | 생성, BLEU / ROUGE-L / BERTScore, 비용표 | - |
 
 ## 실행
 

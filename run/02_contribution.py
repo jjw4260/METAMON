@@ -18,13 +18,13 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from metamon.config import Config, assert_same_data, load as load_cfg
-from metamon.contribution import measure, verify_assembly
-from metamon.data import Splits, load_dataset_file
-from metamon.fleet import load_deltas, verify_restore
-from metamon.metrics import EvalSet, loss, sim, soft_weight
-from metamon.modeling import WeightSpace, gpu_free_gb, load_tokenizer, setup_precision
-from metamon.weightspace import Candidates
+from Pipeline.config import Config, assert_same_data, load as load_cfg
+from Pipeline.contribution import measure, verify_assembly
+from Pipeline.data import Splits, load_dataset_file
+from Pipeline.fleet import load_deltas, verify_restore
+from Pipeline.metrics import EvalSet, loss, sim, soft_weight
+from Pipeline.modeling import WeightSpace, gpu_free_gb, load_tokenizer, setup_precision
+from Pipeline.weightspace import Candidates
 
 
 def main() -> None:

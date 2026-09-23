@@ -16,11 +16,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from metamon.config import Config
-from metamon.data import Splits, load_dataset_file
-from metamon.fleet import build_fleet
-from metamon.metrics import EvalSet
-from metamon.modeling import WeightSpace, load_tokenizer, setup_precision, gpu_free_gb
+from Pipeline.config import Config
+from Pipeline.data import Splits, load_dataset_file
+from Pipeline.fleet import build_fleet
+from Pipeline.metrics import EvalSet
+from Pipeline.modeling import WeightSpace, load_tokenizer, setup_precision, gpu_free_gb
 
 
 def main() -> None:
