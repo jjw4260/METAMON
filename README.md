@@ -29,20 +29,20 @@ Neural-surrogates.
 
 | 파트 | 내용 | 대응 수식 |
 |---|---|---|
-| `Pipeline/config.py` | 하이퍼파라미터, 설정 해시 관문 | - |
-| `Pipeline/target.py` | Target Model(victim) 질의, 캐시, 질의 예산 | `theta_Target`, `y_Target` |
-| `Pipeline/data.py` | 질의 구성, Target 응답 부착, 분할, 중복 검사 | `X`, `Y_Target` |
-| `Pipeline/modeling.py` | 모델 1 인스턴스, 7 종 역할 가중치 공간 | `rho` 정의 |
-| `Pipeline/metrics.py` | 지표와 통계 | `eq:mean_log_probability`, `eq:sim`, `eq:single_fidelity`, `eq:weighted_loss`, `eq:soft_weight`, `eq:single_dependency` |
-| `Pipeline/lord.py` | LoRD 학습 | LoRD Eq.8-11 |
-| `Pipeline/sft.py` | 대조군 fleet | - |
-| `Pipeline/fleet.py` | fleet 준비, 생존 관문, 복원 검증 | `eq:local_update` |
-| `Pipeline/weightspace.py` | 공통 가중치 공간, 다양성 관문 | `eq:norm_matching` (수정판) |
-| `Pipeline/contribution.py` | 기여도와 선택 | `eq:perturbed_loss`, `eq:partial_score`, `eq:layer_selection`, `eq:representative_update`, `eq:assembly_verification` |
-| `Pipeline/aggregate.py` | 조립 방식과 대조군 | - |
-| `Pipeline/evaluate.py` | 배율(check), 최종 비교(test) | - |
-| `Pipeline/dependency.py` | 종속성 세 집합, 앙상블 baseline | `eq:single_dependency`, `eq:dependency_mitigation` |
-| `Pipeline/textgen.py` | 생성, BLEU / ROUGE-L / BERTScore, 비용표 | - |
+| `metamon/config.py` | 하이퍼파라미터, 설정 해시 관문 | - |
+| `metamon/target.py` | Target Model(victim) 질의, 캐시, 질의 예산 | `theta_Target`, `y_Target` |
+| `metamon/data.py` | 질의 구성, Target 응답 부착, 분할, 중복 검사 | `X`, `Y_Target` |
+| `metamon/modeling.py` | 모델 1 인스턴스, 7 종 역할 가중치 공간 | `rho` 정의 |
+| `metamon/metrics.py` | 지표와 통계 | `eq:mean_log_probability`, `eq:sim`, `eq:single_fidelity`, `eq:weighted_loss`, `eq:soft_weight`, `eq:single_dependency` |
+| `metamon/lord.py` | LoRD 학습 | LoRD Eq.8-11 |
+| `metamon/sft.py` | 대조군 fleet | - |
+| `metamon/fleet.py` | fleet 준비, 생존 관문, 복원 검증 | `eq:local_update` |
+| `metamon/weightspace.py` | 공통 가중치 공간, 다양성 관문 | `eq:norm_matching` (수정판) |
+| `metamon/contribution.py` | 기여도와 선택 | `eq:perturbed_loss`, `eq:partial_score`, `eq:layer_selection`, `eq:representative_update`, `eq:assembly_verification` |
+| `metamon/aggregate.py` | 조립 방식과 대조군 | - |
+| `metamon/evaluate.py` | 배율(check), 최종 비교(test) | - |
+| `metamon/dependency.py` | 종속성 세 집합, 앙상블 baseline | `eq:single_dependency`, `eq:dependency_mitigation` |
+| `metamon/textgen.py` | 생성, BLEU / ROUGE-L / BERTScore, 비용표 | - |
 
 ## 실행
 
@@ -106,28 +106,59 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 
 원본은 `LoRD-MEA/lord_train.py`, `train_pod2.py`, `rlhf_train.py` 다.
 
-1. **`log_clip` 은 토큰 단위다.**
-   `clamp(logp_t - old_logp_t, log(1-eps), log(1+eps))` 를 토큰마다 적용한 뒤
-   mask 로 합산한다. 시퀀스 합에 clip 을 걸면 항상 포화해 `L_reg` 의 기울기가
-   0 이 되고, 논문 Table 6 의 `w.o. L_reg -> NC(not converged)` 와 같은 상태가
-   된다. 실제로 그렇게 구현하면 수십 update 안에 모델이 한 문장에 확률 1 을
-   주는 상태로 붕괴한다.
+0. **어느 변형인지부터 맞출 것.** `lord_train.py:1109` 에서
+   `LoRD-VI -> from train_pod2 import train` 이다. 논문 Table 1 의 수치는 이
+   경로에서 나온다. `lord_train.py` 안의 `lord` / `Complex-lord` 는 다른
+   변형이고 손실이 다르다.
 
-2. **확률은 토큰 평균의 지수다.**
+1. **손실에 `y_vic` 가 들어간다** (Eq.10, `train_pod2.py:959-963`).
+
+   ```
+   L_obj = log P(y-|x) - log P(y+|x)
+   L_reg =     log P(y-|x) - log P(y_vic|x)          # lord_variant="code"
+           clip(log P(y-|x) - log P(y_vic|x))        # lord_variant="paper"
+   L     = sigma( 2 * [ (1-lambda1)*L_obj + lambda1*L_reg ] )
+   ```
+
+   `lambda1 = 0.5` 이면 Eq.11 과 같다. Target 응답이 목적함수에 직접 있어야
+   추출 알고리즘이 된다. 이 항이 없으면 자기 표본끼리의 선호 최적화일 뿐이다.
+
+2. **clip 은 `"paper"` 에서만 건다. 기본값은 `"code"` 다.**
+   공개 구현은 clip 항을 `train_pod2.py:941` 에서 계산만 하고 `:963` 의 손실에
+   넣지 않는다. clip 범위가 `[-0.223, +0.182]` 인데 `log P(y-) - log P(y_vic)`
+   는 초반에 이를 크게 벗어나므로, clip 을 걸면 `L_reg` 가 포화해 기울기가 0 이
+   된다. 그 상태가 논문 Table 6 의 `w.o. L_reg -> NC(not converged)` 다.
+   `"paper"` 로 돌릴 때는 로그의 `clip_sat` 을 보고 판단한다.
+
+3. **확률은 토큰 평균의 지수다.**
    `p = exp( sum(logp * mask) / sum(mask) )` 로 (0,1] 범위를 갖는다.
    `tau1 = 0.8` 은 이 값에 대한 임계다. 시퀀스 합을 `log(0.8)` 과 비교하면
-   언제나 참이 되어 cold start 가 100% 발동한다.
+   언제나 참이 되어 cold start 가 100% 발동한다. 손실의 `log P(y|x)` 도 같은
+   길이 정규화를 쓴다. 합을 쓰면 세 후보의 길이 차이가 손실을 지배한다.
 
-3. **swap 은 현재 확률 비교**(`p_neg > p_pos`), **cold 는**
+4. **swap 은 현재 확률 비교**(`p_neg > p_pos`), **cold 는**
    `max(p_pos, p_neg) < tau1` **이고 증가량이** `tau_delta` **미만일 때**
    양성 후보를 Target 응답으로 바꾼다.
 
-4. **period break.** period 안에서 `min(p_pos, p_neg) < tau2` 가 되면 그
+5. **period break.** period 안에서 `min(p_pos, p_neg) < tau2` 가 되면 그
    period 를 끊고 다시 표집한다. 음의 항이 무한히 내려가는 것을 막는 장치다.
 
-5. **생성은 왼쪽 padding, 손실은 오른쪽 padding.** decoder-only 모델의 배치
+6. **period 수는 arm 의 질의 수에 맞춘다.** `periods = 0` 이면
+   `ceil(len(data)/period_chunk) * lord_epochs` 로 잡는다. 고정값을 쓰면
+   질의가 많은 arm(`union_g`, `<fleet>_all`)이 자기 데이터를 다 보지 못한 채
+   끝나 `fleet_g` 와의 비교가 깨진다.
+
+7. **생성은 왼쪽 padding, 손실은 오른쪽 padding.** decoder-only 모델의 배치
    생성에서 오른쪽 padding 을 쓰면 짧은 프롬프트가 padding 위치에서 생성을
    시작한다. 잘라낼 때는 **첫 EOS 를 포함**한다.
+
+### 원본을 그대로 옮기지 않은 두 곳
+
+- 원본은 `torch.mean(logits2_cons)` 로 mask 를 쓰지 않아 프롬프트 토큰이 평균에
+  섞인다(`:986-988` 의 `print` 에서만 mask 를 쓴다). 여기서는 응답 토큰만 쓴다.
+- 원본은 직전 확률을 `sum(exp(logp)*mask)/sum(mask)` 로, 현재 확률을
+  `exp(sum(logp*mask)/sum(mask))` 로 계산해 서로 다른 양을 빼서 `delta` 를
+  만든다(`:581` vs `:638`). 여기서는 둘 다 후자로 통일한다.
 
 ### 임계값 이름 대응
 

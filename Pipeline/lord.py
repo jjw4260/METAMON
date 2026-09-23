@@ -1,27 +1,46 @@
 # -*- coding: utf-8 -*-
-"""LoRD (Liang et al., "Yes, My LoRD").
+"""LoRD-VI (Liang et al., "Yes, My LoRD"). 논문이 보고하는 방법이다.
 
-원본 구현(LoRD-MEA)을 그대로 따른다.
+`lord_train.py:1109` 에서 `LoRD-VI -> from train_pod2 import train` 이다.
+Table 1 의 수치는 이 경로에서 나온다.
 
-    rlhf_train.log_clip(t, eps=0.2) -> clamp(t, log(1-eps), log(1+eps))
-        토큰 단위로 적용한 뒤 mask 로 합산한다.  (이 순서가 중요하다.
-        시퀀스 합에 clip 을 걸면 항상 포화해 L_reg 가 죽고, 논문 Table 6 의
-        "w.o. L_reg -> NC(not converged)" 와 같은 상태가 된다.)
+손실 (Eq.10 / Eq.11, black-box)
+    L_obj = log P(y-|x) - log P(y+|x)
+    L_reg = clip( log P(y-|x) - log P(y_vic|x) )
+    L     = sigma( 2 * [ (1-lambda1) * L_obj + lambda1 * L_reg ] )
 
-    train_pod2.py
-        p  = exp( sum(logp * mask) / sum(mask) )        # (0,1] 정규화 확률
-        delta = p_now - p_prev
-        if p12 > p11: swap                              # 11 이 양성이 되도록
-        if max(p11,p12) < tau1 and delta11 < tau_delta: # cold start
-            y+ <- y_vic
-        if min(p11,p12) < tau2: period_break
+    lambda1 = 0.5 이면 Eq.11 과 같다. 세 항 모두 **Target 응답 y_vic 이
+    목적함수에 직접 들어간다**. 이것이 추출 알고리즘인 이유다.
 
-    lord_train.train_one_period  (black-box: use_vic_logits = 0)
-        loss_vic    = sum(log_clip(logp_pos - old_logp_pos) * mask_pos)
-        loss_reward = sum(logp_pos * mask_pos) - sum(logp_neg * mask_neg)
-        loss        = -(loss_vic + loss_reward)
+    log P(y|x) 는 **응답 토큰만**의 평균 log-probability 로 쓴다.
+    합을 쓰면 세 후보의 길이가 달라 손실이 길이에 지배된다. tau1 이
+    비교하는 p = exp(평균 logp) 와도 같은 양이 된다.
 
-논문 Eq.11 의 sigmoid 는 옵션이다(ablation 상 필수 아님).
+표집과 제어 (train_pod2.py:576-630)
+    p  = exp( sum(logp * mask) / sum(mask) )        # (0,1] 정규화 확률
+    if p12 > p11: swap                              # 11 이 양성이 되도록
+    if max(p11,p12) < tau1 and delta11 < tau_delta: # cold start
+        y+ <- y_vic
+    if min(p11,p12) < tau2: period_break
+
+공개 구현과 논문이 갈리는 곳 (lord_variant 로 고른다)
+    "code"   train_pod2.py:963 의 `loss = los2 + loss11 + 2*loss12` 그대로.
+             L_reg 는 있고 clip 만 없다. 공개 구현은 clip 항(term3)을 :941
+             에서 계산만 하고 손실에 넣지 않는다. Table 1 을 낸 경로이므로
+             이것이 기본값이다.
+    "paper"  Eq.10 을 글자 그대로. clip 을 건다.
+             clip 범위는 [-0.223, +0.182] 인데 log P(y-) - log P(y_vic) 는
+             초반에 이를 크게 벗어나므로 L_reg 가 포화해 기울기가 0 이 된다.
+             그 상태가 곧 Table 6 의 "w.o. L_reg -> NC" 다. 쓰려면 로그의
+             clip_sat 을 보고 판단할 것.
+
+옮기지 않은 원본의 특이점
+    - 원본은 `torch.mean(logits2_cons)` 로 mask 를 쓰지 않아 프롬프트 토큰이
+      평균에 섞인다(:986-988 의 print 에서만 mask 를 쓴다). 여기서는 응답
+      토큰만 쓴다.
+    - 원본은 직전 확률을 `sum(exp(logp)*mask)/sum(mask)` 로, 현재 확률을
+      `exp(sum(logp*mask)/sum(mask))` 로 계산해 서로 다른 양을 빼서 delta 를
+      만든다(:581 vs :638). 여기서는 둘 다 후자로 통일한다.
 """
 from __future__ import annotations
 
@@ -124,6 +143,8 @@ class LordStats:
     swap: int = 0
     cold: int = 0
     clip_sat: float = 0.0
+    obj: float = 0.0
+    reg: float = 0.0
     p_pos: float = 0.0
     p_neg: float = 0.0
     same: float = 0.0
@@ -131,26 +152,43 @@ class LordStats:
     def as_dict(self) -> dict:
         return {"swap": self.swap, "cold": self.cold,
                 "clip_sat": round(self.clip_sat, 4),
+                "obj": round(self.obj, 4), "reg": round(self.reg, 4),
                 "p_pos": round(self.p_pos, 4), "p_neg": round(self.p_neg, 4),
                 "same": round(self.same, 4)}
 
 
-def lord_loss(lp_pos, m_pos, lp_neg, m_neg, old_pos, old_neg,
-              cfg: Config) -> Tuple[torch.Tensor, LordStats]:
-    """lord_train.train_one_period (black-box 경로)."""
-    d_pos = log_clip(lp_pos - old_pos, cfg.log_clip_eps)
-    d_neg = log_clip(lp_neg - old_neg, cfg.log_clip_eps)
+def mean_logp(lp: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """응답 토큰만의 평균 log-probability. log p = log P(y|x) 의 길이 정규화 형."""
+    return (lp * m).sum(1) / m.sum(1).clamp(min=1)
 
-    loss_vic = (d_pos * m_pos).sum(1)
-    loss_reward = (lp_pos * m_pos).sum(1) - (lp_neg * m_neg).sum(1)
-    raw = -(loss_vic + loss_reward)
-    out = torch.sigmoid(raw) if cfg.use_sigmoid else raw
+
+def lord_loss(lp_pos, m_pos, lp_neg, m_neg, lp_vic, m_vic,
+              cfg: Config) -> Tuple[torch.Tensor, LordStats]:
+    """LoRD-VI. Eq.10 / Eq.11.
+
+        L_obj = log P(y-) - log P(y+)
+        L_reg = clip( log P(y-) - log P(y_vic) )        ("paper")
+                     log P(y-) - log P(y_vic)           ("code")
+        L     = sigma( 2 * [ (1-l1) * L_obj + l1 * L_reg ] )
+    """
+    g_pos = mean_logp(lp_pos, m_pos)
+    g_neg = mean_logp(lp_neg, m_neg)
+    g_vic = mean_logp(lp_vic, m_vic)
+
+    obj = g_neg - g_pos
+    reg_raw = g_neg - g_vic
+    reg = log_clip(reg_raw, cfg.log_clip_eps) if cfg.lord_variant == "paper" \
+        else reg_raw
+
+    l1 = cfg.lambda1
+    inner = 2.0 * ((1.0 - l1) * obj + l1 * reg)
+    out = torch.sigmoid(inner) if cfg.use_sigmoid else inner
 
     with torch.no_grad():
         lo, hi = math.log(1 - cfg.log_clip_eps), math.log(1 + cfg.log_clip_eps)
-        r = (lp_pos - old_pos)
-        sat = (((r <= lo) | (r >= hi)).float() * m_pos).sum() / m_pos.sum().clamp(min=1)
-    return out, LordStats(clip_sat=float(sat))
+        sat = float(((reg_raw <= lo) | (reg_raw >= hi)).float().mean())
+        st = LordStats(clip_sat=sat, obj=float(obj.mean()), reg=float(reg.mean()))
+    return out, st
 
 
 # ---------------------------------------------------------------- 학습
@@ -167,8 +205,17 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
     upd = 0
     prev_p: Dict[int, Tuple[float, float]] = {}
 
+    # periods 는 arm 의 질의 수에 맞춘다. 고정값이면 질의가 많은 arm 이
+    # 자기 데이터를 다 보지 못한 채 끝나 union_g 와 fleet_g 의 비교가 깨진다.
+    periods = cfg.periods or max(
+        1, -(-len(data) // cfg.period_chunk) * cfg.lord_epochs)
+    log(f"  [{name}] 질의 {len(data)}  period {periods} x {cfg.period_chunk}  "
+        f"변형 {cfg.lord_variant}  lambda1 {cfg.lambda1}  "
+        f"sigmoid {cfg.use_sigmoid}")
+    sat_warned = False
+
     try:
-        for t in range(cfg.periods):
+        for t in range(periods):
             idx = [(t * cfg.period_chunk + i) % len(data)
                    for i in range(min(cfg.period_chunk, len(data)))]
             chunk = [data[i] for i in idx]
@@ -223,7 +270,6 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
                 log(f"  [{name}] 붕괴 감지 (p+ ~ 1, 두 후보 동일). 학습 중단.")
                 break
 
-            old_pos, old_neg = lp_p.detach().clone(), lp_n.detach().clone()
             ws.model.train()
             order = list(range(len(chunk)))
             random.Random(seed + t).shuffle(order)
@@ -235,9 +281,11 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
                                          pad, ws.device)
                 lp_n2, m_n2 = token_logp(ws.model, bp, [neg_c[j] for j in sl],
                                          pad, ws.device)
-                L, st = lord_loss(lp_p2, m_p2, lp_n2, m_n2,
-                                  old_pos[sl][:, :lp_p2.shape[1]],
-                                  old_neg[sl][:, :lp_n2.shape[1]], cfg)
+                # y_vic. Eq.10 의 L_reg 는 Target 응답을 기준점으로 쓴다.
+                lp_v2, m_v2 = token_logp(ws.model, bp,
+                                         [chunk[j]["gid"] for j in sl],
+                                         pad, ws.device)
+                L, st = lord_loss(lp_p2, m_p2, lp_n2, m_n2, lp_v2, m_v2, cfg)
                 Lm = L.mean()
                 if not torch.isfinite(Lm):
                     raise SystemExit(f"{name}: 비정상 손실 {float(Lm)}")
@@ -250,15 +298,24 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
                 with torch.no_grad():
                     cp = float(norm_prob(lp_p2.detach(), m_p2).median())
                     cn = float(norm_prob(lp_n2.detach(), m_n2).median())
+                    cv = float(norm_prob(lp_v2.detach(), m_v2).median())
                 jl.write(json.dumps({"period": t, "update": upd,
                                      "loss": float(Lm.detach()), "gnorm": gn,
-                                     "p_pos": cp, "p_neg": cn,
+                                     "p_pos": cp, "p_neg": cn, "p_vic": cv,
+                                     "obj": st.obj, "reg": st.reg,
                                      "clip_sat": st.clip_sat}) + "\n")
                 if upd % 16 == 0:
                     jl.flush()
-                    log(f"    u{upd:4d} loss {float(Lm.detach()):9.3f} "
-                        f"gnorm {gn:8.2f} clip_sat {st.clip_sat:.2f} "
-                        f"p+ {cp:.3f} p- {cn:.3f}")
+                    log(f"    u{upd:4d} loss {float(Lm.detach()):8.4f} "
+                        f"gnorm {gn:7.2f} obj {st.obj:+7.3f} reg {st.reg:+7.3f} "
+                        f"clip_sat {st.clip_sat:.2f} "
+                        f"p+ {cp:.3f} p- {cn:.3f} p_vic {cv:.3f}")
+                if (cfg.lord_variant == "paper" and not sat_warned
+                        and upd >= 16 and st.clip_sat > 0.9):
+                    sat_warned = True
+                    log(f"  [{name}] *** clip_sat {st.clip_sat:.2f}. L_reg 가 "
+                        f"포화해 기울기가 없다. 사실상 w.o. L_reg 상태다. "
+                        f"lord_variant='code' 로 돌릴 것.")
                 if min(cp, cn) < cfg.tau2:          # period break
                     broke = True
                     break

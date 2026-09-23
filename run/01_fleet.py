@@ -30,7 +30,11 @@ def main() -> None:
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--fleet-size", type=int, default=2,
                     help="독립 fleet 하나에 묶을 Local 수. n_fleet = k / 이 값")
-    ap.add_argument("--periods", type=int, default=None)
+    ap.add_argument("--periods", type=int, default=None,
+                    help="비우면 arm 의 질의 수에 맞춰 자동으로 잡는다")
+    ap.add_argument("--lord-variant", default=None, choices=["code", "paper"],
+                    help="code=train_pod2.py:963 그대로(기본), paper=Eq.10 의 clip 포함")
+    ap.add_argument("--lambda1", type=float, default=None)
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
 
@@ -38,6 +42,10 @@ def main() -> None:
                  fleet_size=a.fleet_size)
     if a.periods is not None:
         cfg.periods = a.periods
+    if a.lord_variant is not None:
+        cfg.lord_variant = a.lord_variant
+    if a.lambda1 is not None:
+        cfg.lambda1 = a.lambda1
     cfg.makedirs()
     if cfg.n_fleet < 3:
         print(f"  *** n_fleet = {cfg.n_fleet}. 종속성 분산 추정이 얇다. "

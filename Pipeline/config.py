@@ -55,15 +55,37 @@ class Config:
     # union 과 merged 는 본 데이터가 같다. 둘의 차이가 병합 자체의 효과다.
     fleet_size: int = 2
 
-    # ---------------- LoRD (LoRD-MEA 원본) ----------------
-    # p = exp( sum(logp * mask) / sum(mask) )  ∈ (0,1]
+    # ---------------- LoRD (LoRD-VI = 논문이 보고하는 방법) ----------------
+    # lord_train.py:1109  "LoRD-VI" -> from train_pod2 import train
+    #
+    #   Eq.10  L = sum_x  log[P(y-)/P(y+)] + clip(log[P(y-)/P(y_vic)])
+    #   Eq.11  L = sum_x  sigma( 위 )
+    #   Eq.12  lambda1 로 두 항을 볼록결합. lambda1 = 0.5 가 Eq.11 이다
+    #
+    # lord_variant
+    #   "code"   train_pod2.py:963 그대로. L_reg 는 있고 clip 만 없다.
+    #            논문 Table 1 의 수치를 낸 것이 이 경로다. 기본값.
+    #   "paper"  Eq.10 을 글자 그대로. L_reg 에 clip 을 건다.
+    #
+    # clip 범위는 [log0.8, log1.2] = [-0.223, +0.182] 인데
+    # log P(y-) - log P(y_vic) 는 학습 초반에 이 범위를 크게 벗어난다.
+    # 그러면 L_reg 가 포화해 기울기가 0 이 되고 손실이 L_obj 만 남는다 ---
+    # 논문 Table 6 의 "w.o. L_reg -> NC(not converged)" 와 같은 상태다.
+    # "paper" 를 쓸 때는 로그의 clip_sat 을 반드시 볼 것.
+    lord_variant: str = "code"     # "code" | "paper"
+    lambda1: float = 0.5           # 논문 §5.1
     tau1: float = 0.8              # 논문 §5.1. 확률 임계
     tau_delta: float = -0.1        # 논문 §5.1 의 τ2. 증가량 임계
     tau2: float = 0.4              # period break 임계 (train_pod2.py)
     log_clip_eps: float = 0.2      # rlhf_train.log_clip. 토큰 단위 clip
-    use_sigmoid: bool = False      # Eq.11 의 σ(·). 논문 ablation 상 필수 아님
+    use_sigmoid: bool = True       # Eq.11 의 σ(·). 코드 기본 분기도 sigmoid 다
     lord_lr: float = 3e-5          # 논문 §5.1
-    periods: int = 16              # 논문 N_t=512 는 Q=16 기준. 질의 수에 맞춰 조정
+    # periods = 0 이면 arm 의 질의 수에 맞춰 자동으로 잡는다.
+    #   periods = ceil(len(data) / period_chunk) * lord_epochs
+    # 고정값을 쓰면 질의를 많이 가진 arm(union_g, <fleet>_all)이 자기 데이터를
+    # 다 보지 못한 채로 끝나 비교가 깨진다.
+    periods: int = 0
+    lord_epochs: int = 2
     period_chunk: int = 32         # period 당 질의 수. 자주 재표집한다
 
     # ---------------- SFT (대조군 fleet) ----------------
