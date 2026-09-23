@@ -33,27 +33,44 @@ class ArmResult:
         return float(np.mean(self.test))
 
 
+def materialize(ws: WeightSpace, src: Source) -> Dict[Key, torch.Tensor]:
+    """조립 결과를 GPU 에 한 번만 펼친다.
+
+    배율 격자를 도는 동안 src 를 매번 다시 부르면, 후보가 CPU 에 있는 지금
+    구조에서는 격자 크기만큼 K x 154 번 전송한다. 한 번 펼쳐 두면 arm 당
+    전송이 조립대상 한 벌(fp32 3.9GB)로 끝난다.
+    """
+    return {k: src(k).to(ws.device) for k in ws.keys}
+
+
 def scale_curve(ws: WeightSpace, cfg: Config, src: Source, tag: str,
                 check: EvalSet, test: EvalSet,
                 base_check: np.ndarray, base_test: np.ndarray,
                 log=print) -> ArmResult:
-    best_s, best_v, rows = 0.0, float(np.mean(base_check)), []
-    for s in cfg.scales:
-        if s == 0.0:
-            v = base_check
+    mat = materialize(ws, src)
+    msrc: Source = lambda k: mat[k]
+    try:
+        best_s, best_v, rows = 0.0, float(np.mean(base_check)), []
+        for s in cfg.scales:
+            if s == 0.0:
+                v = base_check
+            else:
+                ws.apply(msrc, s)
+                v = sim(ws.model, check)
+            m = float(np.mean(v))
+            rows.append((s, m))
+            if m > best_v:
+                best_v, best_s = m, s
+        if best_s == 0.0:
+            q = base_test
         else:
-            ws.apply(src, s)
-            v = sim(ws.model, check)
-        m = float(np.mean(v))
-        rows.append((s, m))
-        if m > best_v:
-            best_v, best_s = m, s
-    if best_s == 0.0:
-        q = base_test
-    else:
-        ws.apply(src, best_s)
-        q = sim(ws.model, test)
-    ws.reset()
+            ws.apply(msrc, best_s)
+            q = sim(ws.model, test)
+    finally:
+        ws.reset()
+        mat.clear()
+        del mat
+        torch.cuda.empty_cache()
     log(f"  {tag:15s} 배율 {best_s:<7} check {best_v:.5f}  test {np.mean(q):.5f}   "
         + " ".join(f"{s}:{v:.4f}" for s, v in rows))
     return ArmResult(best_s, best_v, q, rows)
