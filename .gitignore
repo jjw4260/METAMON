@@ -1,0 +1,25 @@
+# 실행 산출물
+runs/
+*.pt
+*.pkl
+*.jsonl
+
+# Target 질의 캐시와 응답 (비용이 든 자산이자 Target 의 출력이다.
+# 저장소에 올리지 않는다. 필요하면 별도로 보관할 것.)
+target/
+**/cache.jsonl
+**/dataset.json
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# 편집기 / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

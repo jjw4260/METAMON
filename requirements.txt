@@ -1,0 +1,5 @@
+torch>=2.1
+transformers>=4.40
+datasets>=2.18
+openai>=1.30   # run/00_target.py --provider openai 일 때만 필요
+numpy>=1.24
