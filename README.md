@@ -58,6 +58,10 @@ python run/03_evaluate.py     --out runs/gpt35 --ensemble --text
 python run/04_report.py       --out runs/gpt35
 ```
 
+분할 크기(`n_train`, `n_sel`)는 실행 1 에서 `ckpt/config.json` 에 박힌다.
+실행 2, 3 은 그 파일을 읽으므로 나중에 바꿀 수 없다. 실행 0 의 질의 수와
+맞춰야 한다. `alphas` 와 `scales` 는 실행 2, 3 에서 그때그때 덮어쓸 수 있다.
+
 `--fleet sft` 로 바꾸면 병합 기전만 따로 볼 수 있다. 실행 2 의 결과가 남아
 있으므로 조립 방식만 바꿔 볼 때는 실행 3 부터 다시 돌리면 된다.
 
@@ -232,14 +236,25 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 `fleet_g - union_g` 는 **데이터량이 같은 짝**이다. 종속성 판정과 충실도 판정이
 모두 이 짝 위에 선다.
 
-## 질의 비용 (기본 설정)
+## 비용 (기본 설정, A100 기준)
 
 | 항목 | 수 |
 |---|---|
-| 총 질의 | 3072 (train 2048 / sel 256 / check 256 / test 512) |
+| 총 질의 | 2944 (train 2048 / sel 128 / check 256 / test 512) |
 | Local 하나가 보는 조각 | 256 |
 | `union_g` 가 보는 양 | 512 |
-| 학습할 모델 | 13 |
+| 학습할 모델 | 13 (local 8 + union 4 + all 1) |
 
-`n_train` 을 줄이면 조각이 얇아져 Local 이 안 붙는다. 질의를 아껴야 하면
-`k` 를 줄여 조각을 유지하는 쪽이 낫다.
+| 실행 | 시간 | 무엇에 비례하는가 |
+|---|---|---|
+| 0 Target | ~1.0h | 질의 수. API 직렬 |
+| 1 fleet | ~1.5h | `n_train` x `lord_epochs` |
+| 2 contribution | ~0.8h | **154 x K x `len(alphas)` x `n_sel`** |
+| 3 evaluate | ~0.7h | arm 수 x `len(scales)` x `n_check` |
+
+실행 2 가 가장 비싸고, `n_train` 과는 무관하다. 줄여야 하면 `n_sel` 과
+`alphas` 다. `n_train` 을 줄이면 조각이 얇아져 Local 이 안 붙는다.
+
+`alphas` 를 1 점으로 둔 것은 논문 축이 종속성으로 바뀌었기 때문이다. 주
+결과인 `soup` / `fleet_g` / `union_g` 는 실행 2 를 쓰지 않는다. 기여도 기반
+선택을 본 결과로 쓸 때는 `--alphas 0.125 0.25 0.5` 로 되돌린다.

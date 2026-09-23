@@ -39,8 +39,12 @@ class Config:
     dataset_file: str = "target/dataset.json"
     cache_file: str = "target/cache.jsonl"
 
+    # n_train 은 Local 하나가 보는 조각(n_train / k)을 결정한다. 256 에서
+    # 학습이 붙는 것을 확인했으므로 건드리지 않는다.
+    # n_sel 은 실행 2 의 비용을 그대로 곱한다. 실행 2 는
+    #   154칸 x K후보 x |alphas| 번 sel 전체를 다시 잰다.
     n_train: int = 2048
-    n_sel: int = 256
+    n_sel: int = 128
     n_check: int = 256
     n_test: int = 512
 
@@ -111,9 +115,14 @@ class Config:
     bert_score_model: str = ""     # 비우면 BERTScore 를 건너뛴다
 
     # ---------------- 병합 / 선택 ----------------
-    alphas: List[float] = field(default_factory=lambda: [0.125, 0.25, 0.5])
+    # alphas = eq:partial_score 의 Scale 격자. 실행 2 비용이 여기에 비례한다.
+    #   154 x K x |alphas| 번 sel 을 다시 잰다. K=8, |alphas|=3 이면 3696 번이다.
+    # 논문 축이 종속성으로 바뀌면서 기여도 기반 선택은 주 결과가 아니라
+    # ablation 이 되었다. 주 결과(soup / fleet_g / union_g)는 실행 2 를 쓰지
+    # 않으므로 격자를 1 점으로 둔다. 되돌리려면 --alphas 로 준다.
+    alphas: List[float] = field(default_factory=lambda: [0.25])
     scales: List[float] = field(default_factory=lambda: [
-        0.0, 0.0625, 0.125, 0.1875, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0])
+        0.0, 0.125, 0.25, 0.5, 0.75, 1.0, 1.5, 2.5, 4.0])
     n_random: int = 8
     cos_max: float = 0.90          # 칸별 코사인 중앙값 관문
     beta: float = 0.1              # eq:soft_weight 의 β

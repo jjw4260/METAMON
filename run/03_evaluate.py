@@ -53,11 +53,15 @@ def main() -> None:
                     help="생성 문장을 Target 응답과 비교한다(BLEU/ROUGE-L)")
     ap.add_argument("--text-arms", nargs="*", default=None,
                     help="생성할 arm. 기본은 base/최고Local/soup/metamon_cell")
+    ap.add_argument("--scales", type=float, nargs="*", default=None,
+                    help="배율 격자. 모든 arm 에 같은 값을 준다")
     a = ap.parse_args()
 
     cfg_path = os.path.join(a.out, "ckpt", "config.json")
     cfg = load_cfg(cfg_path)
     cfg.out_root = a.out
+    if a.scales:
+        cfg.scales = sorted(set([0.0] + list(a.scales)))
     device = setup_precision()
     tok = load_tokenizer(cfg)
     sp = Splits(cfg, load_dataset_file(cfg.dataset_path, cfg, tok))

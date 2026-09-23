@@ -32,11 +32,15 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--omega", default="uniform", choices=["uniform", "soft"],
                     help="eq:weighted_loss 의 omega. soft 는 eq:soft_weight")
+    ap.add_argument("--alphas", type=float, nargs="*", default=None,
+                    help="eq:partial_score 의 Scale 격자. 비용이 여기에 비례한다")
     a = ap.parse_args()
 
     cfg_path = os.path.join(a.out, "ckpt", "config.json")
     cfg = load_cfg(cfg_path)
     cfg.out_root = a.out
+    if a.alphas:
+        cfg.alphas = list(a.alphas)
     device = setup_precision()
     tok = load_tokenizer(cfg)
     sp = Splits(cfg, load_dataset_file(cfg.dataset_path, cfg, tok))

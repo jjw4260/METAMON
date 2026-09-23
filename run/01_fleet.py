@@ -35,11 +35,20 @@ def main() -> None:
     ap.add_argument("--lord-variant", default=None, choices=["code", "paper"],
                     help="code=train_pod2.py:963 그대로(기본), paper=Eq.10 의 clip 포함")
     ap.add_argument("--lambda1", type=float, default=None)
+    # 분할 크기는 여기서 고정되어 ckpt/config.json 에 박힌다. 실행 2, 3 은
+    # 그 파일을 읽으므로 나중에 바꿀 수 없다. 실행 0 의 질의 수와 맞출 것.
+    ap.add_argument("--n-train", type=int, default=None)
+    ap.add_argument("--n-sel", type=int, default=None,
+                    help="실행 2 비용이 여기에 비례한다")
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
 
     cfg = Config(out_root=a.out, fleet_method=a.fleet, k=a.k, seed=a.seed,
                  fleet_size=a.fleet_size)
+    if a.n_train is not None:
+        cfg.n_train = a.n_train
+    if a.n_sel is not None:
+        cfg.n_sel = a.n_sel
     if a.periods is not None:
         cfg.periods = a.periods
     if a.lord_variant is not None:
