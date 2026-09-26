@@ -70,6 +70,10 @@ def main() -> None:
     text = ev.get("text") or {}
     victim = ev.get("victim_text") or {}
     ok_text = None
+    if text and not any("vs_ref" in (v or {}) for v in text.values()):
+        print("  03_evaluate.json 이 옛 형식이다(vs_ref 없음). "
+              "run/03_evaluate.py --text 로 다시 만들 것.")
+        text = {}
     if text:
         head = [m for m in METRICS
                 if any(m in (v.get("vs_ref") or {}) for v in text.values())]
@@ -105,7 +109,8 @@ def main() -> None:
             if nm in text:
                 print(f"    {label.get(nm, nm):30s}" + row(nm, "vs_target"))
 
-        if arm in text and best_local in text:
+        if (text.get(arm) or {}).get("vs_target") and \
+                (text.get(best_local) or {}).get("vs_target"):
             ok_text = (text[arm]["vs_target"]["ROUGE-L"]
                        >= text[best_local]["vs_target"]["ROUGE-L"])
             print(f"    -> Target 대비 ROUGE-L 에서 {arm} 이 best_local 에 "

@@ -94,25 +94,50 @@ def rouge_l(hyps: Sequence[str], refs: Sequence[str], beta: float = 1.2) -> floa
 
 
 # ---------------------------------------------------------------- BERTScore
-_BERT_WARNED = False
+_BERT: Dict[str, object] = {}
+_BERT_OFF = [False]
+
+
+def _scorer(model: str, log=print):
+    """BERTScorer 를 한 번만 만들어 재사용한다. score() 를 부를 때마다
+    roberta-large 를 다시 올리면 arm 마다 두 번씩 1.4GB 를 다시 읽는다."""
+    if model in _BERT:
+        return _BERT[model]
+    from bert_score import BERTScorer
+    sc = BERTScorer(model_type=model, batch_size=32, rescale_with_baseline=False,
+                    device="cuda" if torch.cuda.is_available() else "cpu")
+    _BERT[model] = sc
+    log(f"  BERTScore 준비 {model}")
+    return sc
 
 
 def bert_f1(hyps: Sequence[str], refs: Sequence[str], model: str,
             log=print) -> Optional[float]:
-    global _BERT_WARNED
-    if not model:
+    """빈 문자열은 bert-score 의 sent_encode 를 깨뜨린다(최신 transformers 에서
+    build_inputs_with_special_tokens 가 없다). 빈 가설은 F1 0 으로 세고, 참조가
+    비면 그 쌍을 빼고 잰다. 어떤 이유로든 실패하면 None 을 돌려주고 나머지
+    지표는 그대로 낸다 --- 지표 하나 때문에 실행 전체가 죽으면 안 된다."""
+    if not model or _BERT_OFF[0]:
         return None
+    pairs = [(h.strip(), r.strip()) for h, r in zip(hyps, refs)]
+    usable = [(h, r) for h, r in pairs if r]              # 참조가 없으면 못 잰다
+    if not usable:
+        return None
+    ok = [(h, r) for h, r in usable if h]                 # 빈 가설은 0 점
+    if not ok:
+        return 0.0
     try:
-        from bert_score import score as _score
+        sc = _scorer(model, log)
+        _, _, f = sc.score([h for h, _ in ok], [r for _, r in ok])
     except ImportError:
-        if not _BERT_WARNED:
-            log("  BERTScore 건너뜀 (pip install bert-score)")
-            _BERT_WARNED = True
+        log("  BERTScore 건너뜀 (pip install bert-score)")
+        _BERT_OFF[0] = True
         return None
-    _, _, f = _score(list(hyps), list(refs), model_type=model,
-                     verbose=False, batch_size=32,
-                     device="cuda" if torch.cuda.is_available() else "cpu")
-    return float(f.mean())
+    except Exception as e:                                 # 버전 충돌 등
+        log(f"  BERTScore 실패로 이후 건너뜀: {type(e).__name__}: {e}")
+        _BERT_OFF[0] = True
+        return None
+    return float(f.sum()) / len(usable)                    # 빈 가설 = 0 으로 평균
 
 
 def score_pair(hyps: Sequence[str], refs: Sequence[str], cfg: Config,
