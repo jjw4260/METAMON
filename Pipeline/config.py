@@ -110,9 +110,15 @@ class Config:
     # eq:sim 은 Target 응답에 모델이 부여하는 확률이다. "비슷한 답을 내놓는다"
     # 를 주장하려면 모델이 실제로 생성한 문장을 Target 응답과 비교해야 한다.
     # 비교 대상은 데이터셋 정답(ref)이 아니라 Target 응답(gold)이다.
+    # LoRD Table 1 은 **데이터셋 정답 문장(ref)** 에 대고 잰 값이다. 그 표와
+    # 나란히 놓으려면 ref 대비도 내야 하고, Victim 자신을 ref 에 대고 잰 값이
+    # 있어야 Fidelity F = M(local, ref) / M(victim, ref) 가 나온다.
+    # 둘 다 낸다. gold 대비는 추출 충실도, ref 대비는 LoRD 비교용이다.
     text_n: int = 256              # test 중 생성에 쓸 질의 수. 0 이면 전부
     text_temp: float = 0.0         # 0 이면 greedy. 보고용은 greedy 가 낫다
-    bert_score_model: str = ""     # 비우면 BERTScore 를 건너뛴다
+    # LoRD §5 가 쓰는 BERTScore. pip install bert-score 가 필요하다.
+    # 비우면 건너뛴다.
+    bert_score_model: str = "roberta-large"
 
     # ---------------- 병합 / 선택 ----------------
     # alphas = eq:partial_score 의 Scale 격자. 실행 2 비용이 여기에 비례한다.

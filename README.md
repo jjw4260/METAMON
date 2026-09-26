@@ -180,9 +180,21 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 
 ## 측정 규칙
 
-- **생성 비교의 상대는 Target 응답이다.** 데이터셋 정답(`ref`) 과 비교하면
-  번역 품질을 재는 것이지 추출 충실도가 아니다. `textgen.score_text` 는
-  `gold`(Target 응답) 하고만 비교한다.
+- **생성 비교는 두 기준선을 다 낸다.**
+
+  | 기준 | 뜻 | 쓰는 곳 |
+  |---|---|---|
+  | `gold` (Target 응답) 대비 | 추출 충실도 | 본 지표. 주장 1 |
+  | `ref` (데이터셋 정답) 대비 | 번역 품질 | LoRD Table 1 과 같은 축 |
+  | `F = M(local, ref) / M(victim, ref)` | Fidelity (LoRD Eq.12) | 모델 크기가 달라도 비교된다 |
+
+  LoRD Table 1 은 전부 `ref` 대비다. `gold` 대비 수치를 그 표와 나란히 놓으면
+  안 된다. Victim 자신을 `ref` 에 대고 잰 값이 `F` 의 분모이고, 실행 3 이
+  `victim_text` 로 남긴다.
+
+  `MLE` 행은 `--fleet sft` 로 따로 돌려서 채운다. `KD` 는 Target 의 logit 이
+  필요해 black-box 에서는 못 한다 (LoRD §5.1 도 grey-box 에서만 잰다).
+  `N/A (black-box)` 로 둔다.
 - 생성은 왼쪽 padding, 기본은 greedy(`text_temp = 0`) 다. 표집으로 재면
   같은 모델도 매번 다른 BLEU 가 나와 arm 비교가 흔들린다.
 - 선택 기준은 **손실**이다(`eq:weighted_loss`). `avgBF` 는 확률의 평균이라

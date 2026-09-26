@@ -28,7 +28,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Pipeline.config import load as load_cfg
+from metamon.config import load as load_cfg
+from metamon.textgen import METRICS
 
 
 def main() -> None:
@@ -53,36 +54,68 @@ def main() -> None:
 
     # ------------------------------------------------ 주장 1. 충실도
     print(f"[주장 1] 병합({arm}) 이 최고 단일 surrogate 보다 Target 을 잘 재현하는가")
-    t = f"{arm} - best_local"
     ok1 = False
-    if t in cmp_:
-        d, lo, hi = cmp_[t]
-        ok1 = lo > 0
-        print(f"  eq:sim  {t:28s} {d:+.5f}  [{lo:+.5f}, {hi:+.5f}]  "
-              f"{'양수' if lo > 0 else ('음수' if hi < 0 else '불확실')}")
-    else:
-        print(f"  {t} 비교가 없다. 03 의 --arm 설정을 확인할 것.")
+    # 03 이 soup 만 다른 이름으로 남긴다. 태그를 정확히 못 찾으면 접두사로 찾는다.
+    for want in (f"{arm} - best_local", f"{arm} - {cfg.all_name}"):
+        hit = next((k for k in cmp_ if k == want or k.startswith(want + " ")), None)
+        if hit is None:
+            print(f"  {want:34s} 비교 없음")
+            continue
+        d, lo, hi = cmp_[hit]
+        mark = "양수" if lo > 0 else ("음수" if hi < 0 else "불확실")
+        print(f"  eq:sim  {hit:32s} {d:+.5f}  [{lo:+.5f}, {hi:+.5f}]  {mark}")
+        if want.endswith("best_local"):
+            ok1 = lo > 0
 
     text = ev.get("text") or {}
+    victim = ev.get("victim_text") or {}
     ok_text = None
     if text:
-        keys = ("BLEU-1", "BLEU-4", "ROUGE-L", "BERT-F1")
-        head = [k for k in keys if any(k in v for v in text.values())]
-        print(f"  생성 문장 vs Target 응답")
-        print(f"    {'arm':16s}" + "".join(f"{h:>10s}" for h in head))
-        for nm, v in text.items():
-            label = "base" if nm == "__base__" else nm
-            print(f"    {label:16s}" +
-                  "".join(f"{v.get(h, float('nan')):10.2f}" for h in head))
+        head = [m for m in METRICS
+                if any(m in (v.get("vs_ref") or {}) for v in text.values())]
+        label = {"__base__": "Basic theta (Local Model)", "soup": "Uniform Merge",
+                 arm: f"Ours (METAMON, {arm})", cfg.all_name: "All-query LoRD",
+                 best_local: f"Best-Single ({best_local})"}
+
+        def row(nm, key):
+            v = (text.get(nm) or {}).get(key) or {}
+            return "".join(f"{v.get(m, float('nan')):>10.4f}" for m in head)
+
+        # ---- E1. LoRD Table 1 과 같은 축. ref 대비 + Fidelity F
+        print(f"\n  [E1] 데이터셋 정답(ref) 대비 — LoRD Table 1 과 같은 기준")
+        print(f"    {'Method':30s}" + "".join(f"{m:>10s}" for m in head)
+              + f"{'F(ROUGE-L)':>12s}")
+        print(f"    {'Target Model':30s}"
+              + "".join(f"{victim.get(m, float('nan')):>10.4f}" for m in head)
+              + f"{1.0:>12.3f}")
+        order = (["__base__"] + [n for n in text if n.startswith("local_")]
+                 + [n for n in (cfg.all_name, "soup", "metamon_cell",
+                                "metamon_layer") if n in text])
+        for nm in order:
+            if nm not in text:
+                continue
+            f = (text[nm].get("F") or {}).get("ROUGE-L", float("nan"))
+            print(f"    {label.get(nm, nm):30s}" + row(nm, "vs_ref")
+                  + f"{f:>12.3f}")
+
+        # ---- 추출 충실도. Target 응답 대비
+        print(f"\n  [추출 충실도] Target 응답(gold) 대비 — 이쪽이 본 지표")
+        print(f"    {'Method':30s}" + "".join(f"{m:>10s}" for m in head))
+        for nm in order:
+            if nm in text:
+                print(f"    {label.get(nm, nm):30s}" + row(nm, "vs_target"))
+
         if arm in text and best_local in text:
-            ok_text = text[arm]["ROUGE-L"] >= text[best_local]["ROUGE-L"]
-            print(f"    -> ROUGE-L 에서 {arm} 이 best_local 에 "
+            ok_text = (text[arm]["vs_target"]["ROUGE-L"]
+                       >= text[best_local]["vs_target"]["ROUGE-L"])
+            print(f"    -> Target 대비 ROUGE-L 에서 {arm} 이 best_local 에 "
                   f"{'앞선다' if ok_text else '뒤진다'}")
         for nm in (arm, best_local):
             for s in (text.get(nm, {}).get("sample") or [])[:1]:
                 print(f"    [{nm} 예시]")
-                print(f"      Target    {s['target'][:90]}")
-                print(f"      surrogate {s['surrogate'][:90]}")
+                print(f"      Target    {s['target'][:88]}")
+                print(f"      ref       {str(s.get('ref',''))[:88]}")
+                print(f"      surrogate {s['surrogate'][:88]}")
     else:
         print("  생성 비교 없음. run/03_evaluate.py --text 로 다시 돌릴 것.")
 

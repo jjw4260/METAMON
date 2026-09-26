@@ -26,17 +26,18 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Pipeline.aggregate import build_sources, weight_spread, weighted
-from Pipeline.config import assert_same_data, load as load_cfg
-from Pipeline.contribution import Contribution
-from Pipeline.data import Splits, load_dataset_file
-from Pipeline.dependency import output_ensemble, recovery_ratio, surrogate_dependency
-from Pipeline.evaluate import compare, mean_of, pick_best_local, run_all, scale_curve
-from Pipeline.fleet import load_deltas
-from Pipeline.metrics import EvalSet, paired_bootstrap, sim, verdict
-from Pipeline.modeling import WeightSpace, load_tokenizer, setup_precision
-from Pipeline.textgen import cost_table, generate, score_text
-from Pipeline.weightspace import Candidates
+from metamon.aggregate import build_sources, weight_spread, weighted
+from metamon.config import assert_same_data, load as load_cfg
+from metamon.contribution import Contribution
+from metamon.data import Splits, load_dataset_file
+from metamon.dependency import output_ensemble, recovery_ratio, surrogate_dependency
+from metamon.evaluate import compare, mean_of, pick_best_local, run_all, scale_curve
+from metamon.fleet import load_deltas
+from metamon.metrics import EvalSet, paired_bootstrap, sim, verdict
+from metamon.modeling import WeightSpace, load_tokenizer, setup_precision
+from metamon.textgen import (METRICS, cost_table, generate, score_text,
+                             victim_scores)
+from metamon.weightspace import Candidates
 
 
 def _keys(d):
@@ -52,7 +53,7 @@ def main() -> None:
     ap.add_argument("--text", action="store_true",
                     help="생성 문장을 Target 응답과 비교한다(BLEU/ROUGE-L)")
     ap.add_argument("--text-arms", nargs="*", default=None,
-                    help="생성할 arm. 기본은 base/최고Local/soup/metamon_cell")
+                    help="생성할 arm. 기본은 base + Local 전부 + soup/metamon/all")
     ap.add_argument("--scales", type=float, nargs="*", default=None,
                     help="배율 격자. 모든 arm 에 같은 값을 준다")
     a = ap.parse_args()
@@ -99,7 +100,7 @@ def main() -> None:
              + [f"weighted_t{t}" for t in a.taus])
     res = run_all(ws, cfg, src, names, check, test)
 
-    from Pipeline.evaluate import ArmResult
+    from metamon.evaluate import ArmResult
     rand = mean_of(res, "random_", cfg.n_random)
     shuf = mean_of(res, "shuffle_", cfg.n_random)
     res["random_mean"] = ArmResult(0.0, 0.0, rand, [])
@@ -111,17 +112,17 @@ def main() -> None:
     print(f"\n[결과] test {len(sp.test)} 질의, paired bootstrap 95%   "
           f"best_local={best_local} (check 기준),  weighted tau={best_tau}")
     pairs = []
-    for nm in ("metamon_layer", "metamon_cell", "weighted"):
+    for nm in ("soup", "metamon_layer", "metamon_cell", "weighted"):
         pairs += [
             (f"{nm} - {cfg.all_name}", nm, cfg.all_name),
             (f"{nm} - best_local", nm, best_local),
-            (f"{nm} - soup", nm, "soup"),
             (f"{nm} - random 평균", nm, "random_mean"),
         ]
+        if nm != "soup":
+            pairs.append((f"{nm} - soup", nm, "soup"))
     pairs += [
         ("metamon_layer - shuffle 평균 (위치 선택)", "metamon_layer", "shuffle_mean"),
         ("shuffle 평균 - random 평균 (집중 효과)", "shuffle_mean", "random_mean"),
-        ("soup - best_local (병합 자체)", "soup", best_local),
     ]
     # 데이터량을 맞춘 짝. fleet_g 와 union_g 는 같은 조각을 봤다.
     for g in range(cfg.n_fleet):
@@ -142,16 +143,23 @@ def main() -> None:
         recovery_ratio(ens, res["soup"].test, res[best_local].test)
         ens_mean = float(np.mean(ens))
 
-    # ---- 텍스트 수준. 생성 문장을 Target 응답과 비교한다.
+    # ---- 텍스트 수준. 두 기준선을 다 잰다.
+    #      gold(Target 응답) 대비 = 추출 충실도
+    #      ref(데이터셋 정답) 대비 = LoRD Table 1 과 같은 축. Fidelity F 의 분자
     text = {}
+    victim = None
     if a.text:
         pool = sp.test[: cfg.text_n] if cfg.text_n else sp.test
         gold = [x["gold"].strip() for x in pool]
-        arms = a.text_arms or ["__base__", best_local, "soup", "metamon_cell",
-                               cfg.all_name]
-        print(f"\n[텍스트] {len(pool)} 질의 생성, Target 응답과 비교 "
-              f"({'greedy' if cfg.text_temp <= 0 else f'T={cfg.text_temp}'})")
-        print(f"  *** 비교 대상은 데이터셋 정답이 아니라 Target 응답이다.")
+        ref = [str(x["ref"]).strip() for x in pool]
+        arms = a.text_arms or (["__base__"] + cfg.local_names
+                               + ["soup", "metamon_cell", "metamon_layer",
+                                  cfg.all_name])
+        print(f"\n[텍스트] {len(pool)} 질의 생성 "
+              f"({'greedy' if cfg.text_temp <= 0 else f'T={cfg.text_temp}'})   "
+              f"BERTScore {cfg.bert_score_model or '끔'}")
+        # Fidelity F 의 분모. Victim 을 ref 에 대고 잰 값이다.
+        victim = victim_scores(gold, ref, cfg)
         for nm in arms:
             if nm == "__base__":
                 ws.reset()
@@ -161,9 +169,10 @@ def main() -> None:
                 print(f"  {nm} 없음. 건너뜀")
                 continue
             hyp = generate(ws.model, tok, pool, cfg, device)
-            text[nm] = score_text(hyp, gold, cfg, tag=nm)
+            text[nm] = score_text(hyp, gold, ref, cfg, victim=victim, tag=nm)
             text[nm]["sample"] = [{"prompt": pool[i]["prompt"],
-                                   "target": gold[i], "surrogate": hyp[i]}
+                                   "target": gold[i], "ref": ref[i],
+                                   "surrogate": hyp[i]}
                                   for i in range(min(3, len(pool)))]
             ws.reset()
             torch.cuda.empty_cache()
@@ -178,7 +187,7 @@ def main() -> None:
         "test_per_query": {n: list(map(float, r.test)) for n, r in res.items()},
         "curves": {n: r.curve for n, r in res.items() if r.curve},
         "compare": {k: list(v) for k, v in table.items()},
-        "dependency": dep, "text": text, "cost": cost,
+        "dependency": dep, "text": text, "victim_text": victim, "cost": cost,
         "ensemble_mean": ens_mean,
     }
     path = os.path.join(cfg.log_dir, "03_evaluate.json")

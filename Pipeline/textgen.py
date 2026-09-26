@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 """텍스트 수준 충실도.
 
-eq:sim 은 Target 응답에 모델이 부여하는 확률이다. 확률이 높다는 것과 실제로
-비슷한 문장을 생성한다는 것은 다르다. "작은 모델이 큰 모델과 비슷한 답변을
-내놓는다" 를 주장하려면 모델이 **생성한** 문장을 Target 응답과 비교해야 한다.
+**두 기준선을 모두 낸다.** 둘은 다른 질문에 답한다.
 
-비교 대상은 데이터셋 정답(ref)이 아니라 **Target 응답(gold)** 이다. ref 와
-비교하면 번역 품질을 재는 것이고, 추출 충실도가 아니다.
+    vs Target   모델 생성 문장 vs Target 응답(gold).
+                "작은 모델이 Target 과 비슷한 답을 내는가". 추출 충실도다.
 
-지표는 LoRD 논문 §5 와 같은 것을 쓴다.
-    BLEU-1 / BLEU-4   n-gram 정밀도 + 길이 벌점
-    ROUGE-L           LCS 기반 F1
-    BERTScore         bert_score 가 설치돼 있고 cfg.bert_score_model 이
-                      비어 있지 않을 때만 잰다
+    vs ref      모델 생성 문장 vs 데이터셋 정답 문장(ref).
+                LoRD 논문 Table 1 이 쓰는 기준이다. 그 표와 나란히 놓으려면
+                이쪽이 있어야 한다. Victim 자신도 이 기준으로 잰다.
+
+    Fidelity F  eq:12 (LoRD).  F = M(y_Nt, y) / M(y_vic, y)
+                분모는 Victim 을 ref 에 대고 잰 값이다. Victim 이 1.000 이고,
+                추출 모델이 Victim 의 몇 %까지 왔는지를 말한다.
+                모델 크기가 달라도 비교할 수 있는 유일한 축이다.
+
+지표는 LoRD §5 와 같다. BLEU-1 / BLEU-4 / ROUGE-L / BERTScore-F1.
 
 생성은 왼쪽 padding 이다. decoder-only 모델에서 오른쪽 padding 으로 배치
 생성을 하면 짧은 프롬프트가 padding 위치에서 생성을 시작한다.
@@ -27,6 +30,8 @@ from typing import Dict, List, Optional, Sequence
 import torch
 
 from .config import Config
+
+METRICS = ("BLEU-1", "BLEU-4", "ROUGE-L", "BERT-F1")
 
 # sacrebleu 의 13a 토크나이저를 줄인 것. 구두점을 떼고 공백으로 나눈다.
 _PUNCT = re.compile(r"([\.,!?\"';:\(\)\[\]<>/\\])")
@@ -43,7 +48,7 @@ def _ngrams(toks: Sequence[str], n: int) -> Counter:
 
 
 def bleu(hyps: Sequence[str], refs: Sequence[str], max_n: int = 4) -> float:
-    """말뭉치 BLEU. 참조는 Target 응답 하나다."""
+    """말뭉치 BLEU. 참조는 하나다."""
     num = [0] * max_n
     den = [0] * max_n
     hyp_len = ref_len = 0
@@ -59,7 +64,7 @@ def bleu(hyps: Sequence[str], refs: Sequence[str], max_n: int = 4) -> float:
         return 0.0
     logp = sum(math.log(num[i] / den[i]) for i in range(max_n)) / max_n
     bp = 1.0 if hyp_len > ref_len else math.exp(1 - ref_len / max(hyp_len, 1))
-    return 100.0 * bp * math.exp(logp)
+    return bp * math.exp(logp)
 
 
 # ---------------------------------------------------------------- ROUGE-L
@@ -85,23 +90,76 @@ def rouge_l(hyps: Sequence[str], refs: Sequence[str], beta: float = 1.2) -> floa
             continue
         p, q = l / len(ht), l / len(rt)
         tot += ((1 + beta ** 2) * p * q) / (q + beta ** 2 * p)
-    return 100.0 * tot / max(len(hyps), 1)
+    return tot / max(len(hyps), 1)
 
 
 # ---------------------------------------------------------------- BERTScore
-def bert_score(hyps: Sequence[str], refs: Sequence[str], model: str,
-               log=print) -> Optional[Dict[str, float]]:
+_BERT_WARNED = False
+
+
+def bert_f1(hyps: Sequence[str], refs: Sequence[str], model: str,
+            log=print) -> Optional[float]:
+    global _BERT_WARNED
     if not model:
         return None
     try:
         from bert_score import score as _score
     except ImportError:
-        log("  BERTScore 건너뜀 (pip install bert-score)")
+        if not _BERT_WARNED:
+            log("  BERTScore 건너뜀 (pip install bert-score)")
+            _BERT_WARNED = True
         return None
-    p, r, f = _score(list(hyps), list(refs), model_type=model,
-                     verbose=False, batch_size=32)
-    return {"P": float(p.mean()) * 100, "R": float(r.mean()) * 100,
-            "F1": float(f.mean()) * 100}
+    _, _, f = _score(list(hyps), list(refs), model_type=model,
+                     verbose=False, batch_size=32,
+                     device="cuda" if torch.cuda.is_available() else "cpu")
+    return float(f.mean())
+
+
+def score_pair(hyps: Sequence[str], refs: Sequence[str], cfg: Config,
+               log=print) -> Dict[str, float]:
+    """한 쌍에 대한 네 지표. 0~1 범위로 둔다(LoRD Table 1 과 같은 축)."""
+    r: Dict[str, float] = {
+        "BLEU-1": bleu(hyps, refs, 1),
+        "BLEU-4": bleu(hyps, refs, 4),
+        "ROUGE-L": rouge_l(hyps, refs),
+        "len": sum(len(tokenize(h)) for h in hyps) / max(len(hyps), 1),
+    }
+    b = bert_f1(hyps, refs, cfg.bert_score_model, log)
+    if b is not None:
+        r["BERT-F1"] = b
+    return r
+
+
+def victim_scores(gold: Sequence[str], ref: Sequence[str], cfg: Config,
+                  log=print) -> Dict[str, float]:
+    """Victim 자신을 ref 에 대고 잰 값. Fidelity F 의 분모다."""
+    v = score_pair(gold, ref, cfg, log)
+    log("  " + f"{'Target Model (vs ref)':22s}" +
+        "  ".join(f"{m} {v.get(m, float('nan')):.4f}" for m in METRICS
+                  if m in v))
+    return v
+
+
+def score_text(hyps: Sequence[str], gold: Sequence[str], ref: Sequence[str],
+               cfg: Config, victim: Optional[Dict[str, float]] = None,
+               tag: str = "", log=print) -> Dict[str, object]:
+    """생성 문장을 두 기준선에 대고 재고, Fidelity F 를 붙인다."""
+    out: Dict[str, object] = {
+        "vs_target": score_pair(hyps, gold, cfg, log),
+        "vs_ref": score_pair(hyps, ref, cfg, log),
+    }
+    if victim:
+        vr = out["vs_ref"]                                  # type: ignore
+        out["F"] = {m: (vr[m] / victim[m]) for m in METRICS
+                    if m in vr and victim.get(m, 0.0) > 0}
+    if tag:
+        vt, vr = out["vs_target"], out["vs_ref"]            # type: ignore
+        f = out.get("F") or {}
+        log(f"  {tag:15s} "
+            f"vsTgt B4 {vt['BLEU-4']:.4f} RL {vt['ROUGE-L']:.4f} | "
+            f"vsRef B4 {vr['BLEU-4']:.4f} RL {vr['ROUGE-L']:.4f} | "
+            f"F(RL) {f.get('ROUGE-L', float('nan')):.3f}")
+    return out
 
 
 # ---------------------------------------------------------------- 생성
@@ -132,20 +190,6 @@ def generate(model, tok, items: Sequence[dict], cfg: Config, device: str,
         return out  # type: ignore
     finally:
         tok.padding_side = side
-
-
-def score_text(hyps: Sequence[str], golds: Sequence[str], cfg: Config,
-               tag: str = "", log=print) -> Dict[str, float]:
-    """생성 문장 vs Target 응답. ref 가 아니라 gold 와 비교한다."""
-    r = {"BLEU-1": bleu(hyps, golds, 1), "BLEU-4": bleu(hyps, golds, 4),
-         "ROUGE-L": rouge_l(hyps, golds),
-         "len": sum(len(tokenize(h)) for h in hyps) / max(len(hyps), 1)}
-    bs = bert_score(hyps, golds, cfg.bert_score_model, log)
-    if bs:
-        r.update({f"BERT-{k}": v for k, v in bs.items()})
-    if tag:
-        log(f"  {tag:15s} " + "  ".join(f"{k} {v:6.2f}" for k, v in r.items()))
-    return r
 
 
 # ---------------------------------------------------------------- 비용

@@ -3,3 +3,4 @@ transformers>=4.40
 datasets>=2.18
 openai>=1.30   # run/00_target.py --provider openai 일 때만 필요
 numpy>=1.24
+bert-score>=0.3.13   # BERTScore-F1. 없으면 건너뛴다
