@@ -26,18 +26,18 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from metamon.aggregate import build_sources, weight_spread, weighted
-from metamon.config import assert_same_data, load as load_cfg
-from metamon.contribution import Contribution
-from metamon.data import Splits, load_dataset_file
-from metamon.dependency import output_ensemble, recovery_ratio, surrogate_dependency
-from metamon.evaluate import compare, mean_of, pick_best_local, run_all, scale_curve
-from metamon.fleet import load_deltas
-from metamon.metrics import EvalSet, paired_bootstrap, sim, verdict
-from metamon.modeling import WeightSpace, load_tokenizer, setup_precision
-from metamon.textgen import (METRICS, cost_table, generate, score_text,
+from Pipeline.aggregate import build_sources, weight_spread, weighted
+from Pipeline.config import assert_same_data, load as load_cfg
+from Pipeline.contribution import Contribution
+from Pipeline.data import Splits, load_dataset_file
+from Pipeline.dependency import output_ensemble, recovery_ratio, surrogate_dependency
+from Pipeline.evaluate import compare, mean_of, pick_best_local, run_all, scale_curve
+from Pipeline.fleet import load_deltas
+from Pipeline.metrics import EvalSet, paired_bootstrap, sim, verdict
+from Pipeline.modeling import WeightSpace, load_tokenizer, setup_precision
+from Pipeline.textgen import (METRICS, cost_table, generate, score_text,
                              victim_scores)
-from metamon.weightspace import Candidates
+from Pipeline.weightspace import Candidates
 
 
 def _keys(d):
@@ -100,7 +100,7 @@ def main() -> None:
              + [f"weighted_t{t}" for t in a.taus])
     res = run_all(ws, cfg, src, names, check, test)
 
-    from metamon.evaluate import ArmResult
+    from Pipeline.evaluate import ArmResult
     rand = mean_of(res, "random_", cfg.n_random)
     shuf = mean_of(res, "shuffle_", cfg.n_random)
     res["random_mean"] = ArmResult(0.0, 0.0, rand, [])

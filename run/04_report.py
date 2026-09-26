@@ -28,8 +28,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from metamon.config import load as load_cfg
-from metamon.textgen import METRICS
+from Pipeline.config import load as load_cfg
+from Pipeline.textgen import METRICS
 
 
 def main() -> None:
