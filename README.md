@@ -14,10 +14,16 @@ Neural-surrogates.
 확률(`eq:sim`) 과 생성 문장(BLEU / ROUGE-L) 양쪽에서 본다. 확률만 높고 문장이
 안 비슷하면 주장이 아니다.
 
-**2. 종속성.** `Dependency(merged) < Dependency(union)`.
-`union_g` 는 fleet `g` 의 조각을 **합쳐서** 학습한 단일 모델이고, `fleet_g` 는
-같은 조각들을 따로 학습한 뒤 병합한 것이다. 둘은 본 데이터가 같다. 그래서 분산
-차이가 병합 자체의 효과가 된다. 이 대조 없이 낸 종속성 숫자는 "데이터를 더 봤을
+**2. 종속성.** 병합 크기 `m` 이 커지면 surrogate 선택에 따른 분산이 단조로
+줄어든다. `cm{m}_{g}` 는 K 개 Local 을 `m` 개씩 겹치지 않게 묶어 평균한 것이고
+`m = 1` 이 단일 surrogate 다. `m in {1, 2, 4, 8}` 네 점에서 재므로 한 쌍의
+비교가 아니라 곡선이 근거가 된다. 한 쌍만 보면 좋은 Local 과 나쁜 Local 이
+1:1 로 섞여 희석이 안 되는 경우에 걸린다(`m = 2` 에서 실제로 걸렸다).
+
+같이 `Dependency(merged) < Dependency(union)` 도 본다.
+`union_g` 는 fleet `g` 의 조각을 **합쳐서** 학습한 단일 모델이고,
+`cm{m}_{g}` 는 같은 조각들을 따로 학습한 뒤 병합한 것이다. 둘은 본 데이터가
+같다. 그래서 분산 차이가 병합 자체의 효과가 된다. 이 대조 없이 낸 종속성 숫자는 "데이터를 더 봤을
 뿐" 으로 반박당한다. leave-one-out 분산은 K 개 중 K-1 개를 공유하므로 줄어드는
 것이 구성상 거의 자동이다. 참고로만 찍고 판정에는 쓰지 않는다.
 
@@ -29,20 +35,20 @@ Neural-surrogates.
 
 | 파트 | 내용 | 대응 수식 |
 |---|---|---|
-| `metamon/config.py` | 하이퍼파라미터, 설정 해시 관문 | - |
-| `metamon/target.py` | Target Model(victim) 질의, 캐시, 질의 예산 | `theta_Target`, `y_Target` |
-| `metamon/data.py` | 질의 구성, Target 응답 부착, 분할, 중복 검사 | `X`, `Y_Target` |
-| `metamon/modeling.py` | 모델 1 인스턴스, 7 종 역할 가중치 공간 | `rho` 정의 |
-| `metamon/metrics.py` | 지표와 통계 | `eq:mean_log_probability`, `eq:sim`, `eq:single_fidelity`, `eq:weighted_loss`, `eq:soft_weight`, `eq:single_dependency` |
-| `metamon/lord.py` | LoRD 학습 | LoRD Eq.8-11 |
-| `metamon/sft.py` | 대조군 fleet | - |
-| `metamon/fleet.py` | fleet 준비, 생존 관문, 복원 검증 | `eq:local_update` |
-| `metamon/weightspace.py` | 공통 가중치 공간, 다양성 관문 | `eq:norm_matching` (수정판) |
-| `metamon/contribution.py` | 기여도와 선택 | `eq:perturbed_loss`, `eq:partial_score`, `eq:layer_selection`, `eq:representative_update`, `eq:assembly_verification` |
-| `metamon/aggregate.py` | 조립 방식과 대조군 | - |
-| `metamon/evaluate.py` | 배율(check), 최종 비교(test) | - |
-| `metamon/dependency.py` | 종속성 세 집합, 앙상블 baseline | `eq:single_dependency`, `eq:dependency_mitigation` |
-| `metamon/textgen.py` | 생성, BLEU / ROUGE-L / BERTScore, 비용표 | - |
+| `Pipeline/config.py` | 하이퍼파라미터, 설정 해시 관문 | - |
+| `Pipeline/target.py` | Target Model(victim) 질의, 캐시, 질의 예산 | `theta_Target`, `y_Target` |
+| `Pipeline/data.py` | 질의 구성, Target 응답 부착, 분할, 중복 검사 | `X`, `Y_Target` |
+| `Pipeline/modeling.py` | 모델 1 인스턴스, 7 종 역할 가중치 공간 | `rho` 정의 |
+| `Pipeline/metrics.py` | 지표와 통계 | `eq:mean_log_probability`, `eq:sim`, `eq:single_fidelity`, `eq:weighted_loss`, `eq:soft_weight`, `eq:single_dependency` |
+| `Pipeline/lord.py` | LoRD 학습 | LoRD Eq.8-11 |
+| `Pipeline/sft.py` | 대조군 fleet | - |
+| `Pipeline/fleet.py` | fleet 준비, 생존 관문, 복원 검증 | `eq:local_update` |
+| `Pipeline/weightspace.py` | 공통 가중치 공간, 다양성 관문 | `eq:norm_matching` (수정판) |
+| `Pipeline/contribution.py` | 기여도와 선택 | `eq:perturbed_loss`, `eq:partial_score`, `eq:layer_selection`, `eq:representative_update`, `eq:assembly_verification` |
+| `Pipeline/aggregate.py` | 조립 방식과 대조군 | - |
+| `Pipeline/evaluate.py` | 배율(check), 최종 비교(test) | - |
+| `Pipeline/dependency.py` | 종속성 세 집합, 앙상블 baseline | `eq:single_dependency`, `eq:dependency_mitigation` |
+| `Pipeline/textgen.py` | 생성, BLEU / ROUGE-L / BERTScore, 비용표 | - |
 
 ## 실행
 
@@ -51,8 +57,8 @@ pip install -r requirements.txt
 
 export OPENAI_API_KEY=...
 python run/00_target.py       --out runs/gpt35 --model gpt-3.5-turbo-1106 \
-                              --budget 3072
-python run/01_fleet.py        --out runs/gpt35 --fleet lord --k 8 --fleet-size 2
+                              --budget 4992
+python run/01_fleet.py        --out runs/gpt35 --fleet lord --k 16 --fleet-size 4
 python run/02_contribution.py --out runs/gpt35
 python run/03_evaluate.py     --out runs/gpt35 --ensemble --text
 python run/04_report.py       --out runs/gpt35
@@ -65,9 +71,11 @@ python run/04_report.py       --out runs/gpt35
 `--fleet sft` 로 바꾸면 병합 기전만 따로 볼 수 있다. 실행 2 의 결과가 남아
 있으므로 조립 방식만 바꿔 볼 때는 실행 3 부터 다시 돌리면 된다.
 
-`--k 8 --fleet-size 2` 면 학습할 모델이 Local 8 + union 4 + 전체 1 = 13 개다.
-`--k 4 --fleet-size 2` 로 줄이면 7 개로 끝나지만 독립 fleet 이 2 개뿐이라
-종속성 분산 추정이 얇다. 그때는 실행 1 과 4 가 경고를 찍는다.
+`--k 16 --fleet-size 4` 면 학습할 모델이 Local 16 + union 4 + 전체 1 = 21 개다.
+`--k 8 --fleet-size 2` 로 줄이면 13 개로 끝나지만 종속성 곡선의 점이 `m = 1, 2`
+둘뿐이라 단조성을 말할 수 없다. 곡선은 `curve_sizes` 중 `k % m == 0` 이고
+묶음이 2 개 이상인 `m` 만 쓴다. 독립 fleet 이 3 개 미만이면 실행 1 이 경고를
+찍는다.
 
 ## Target Model
 
@@ -92,7 +100,7 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 
 `eq:sim` 은 **Target 응답**에 모델이 부여하는 확률이다. 따라서 `sel`, `check`,
 `test` 도 Target 응답이 필요하다. 총 질의 수는
-`n_train + n_sel + n_check + n_test` 다. 기본 설정에서 2048 회다.
+`n_train + n_sel + n_check + n_test` 다. 기본 설정에서 4992 회다.
 줄이려면 `n_test` 가 아니라 `n_train` 을 줄인다. LoRD 의 주장이 질의 효율이므로
 `n_train` 이 작을수록 오히려 논지에 맞다.
 
@@ -150,7 +158,7 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 6. **period 수는 arm 의 질의 수에 맞춘다.** `periods = 0` 이면
    `ceil(len(data)/period_chunk) * lord_epochs` 로 잡는다. 고정값을 쓰면
    질의가 많은 arm(`union_g`, `<fleet>_all`)이 자기 데이터를 다 보지 못한 채
-   끝나 `fleet_g` 와의 비교가 깨진다.
+   끝나 `cm{m}_{g}` 와의 비교가 깨진다.
 
 7. **생성은 왼쪽 padding, 손실은 오른쪽 padding.** decoder-only 모델의 배치
    생성에서 오른쪽 padding 을 쓰면 짧은 프롬프트가 padding 위치에서 생성을
@@ -206,12 +214,17 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 - 측정에 쓴 후보를 **그대로** 조립한다. 고른 뒤 크기를 바꾸면 다른 대상을
   평가한 것이 된다.
 - 배율은 `check` 에서만 고르고 `test` 는 한 번만 잰다. 최고 Local 도 `check`
-  에서 고른다.
+  에서 고른다. **기준은 셋이고 보고하는 지표와 같은 것을 쓴다.** `avgBF` 로
+  고르면 생성에서 5 위인 Local 이 뽑힌다. 확률 판정은 손실 기준 최고 Local,
+  생성 판정은 `check` 생성 ROUGE-L 기준 최고 Local 을 상대로 한다.
 - 모든 arm 에 **같은 배율 격자**를 준다. 상한을 고른 arm 이 있으면 경고한다.
 - 기여도 측정은 FP32 로 한다. bf16 은 칸별 차이(1e-4 수준)보다 오차가 커서
   승자가 30% 이상 바뀐다.
 - 비교는 질의별 값에 대한 paired bootstrap 이다. 이 구간은 고정된 checkpoint
   에 대한 표본 불확실성이며, 학습 시드 반복을 대신하지 않는다.
+- **생성 지표에도 구간을 낸다.** 질의쌍을 재표집하고 BLEU 는 재표집마다 코퍼스
+  수준에서 다시 계산한다(Koehn 2004). ROUGE-L 은 질의별 값의 평균이다. 구간
+  없이 `0.4347 > 0.4177` 만 써서 이겼다고 말하면 안 된다.
 
 ## 관문
 
@@ -231,8 +244,10 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 | `<fleet>_all` | 전체 질의로 학습한 단일 모델. 상한선 |
 | `local_k` | 개별 Local. 조각 1 개 분량 |
 | `union_g` | fleet `g` 의 조각을 합쳐 학습한 단일 모델. **병합 없음** |
-| `fleet_g` | 같은 조각들을 따로 학습한 뒤 평균. **병합 있음** |
-| `metamon_layer` | `eq:layer_selection` 기반 조립 (주 결과) |
+| `cm{m}_{g}` | Local 을 `m` 개씩 겹치지 않게 묶어 평균. **병합 있음**. 종속성 곡선의 한 점이고 `m = fleet_size` 가 `union_g` 의 짝이다 |
+| `greedy_soup` | 최고 단일에서 출발해 `check` 가 좋아질 때만 하나씩 더한다 (Wortsman et al.) |
+| `metamon_greedy` | 최고 단일에서 출발해 PartialScore 큰 칸부터 갈아끼우고 `check` 가 좋아질 때만 채택 (주 결과) |
+| `metamon_layer` | `eq:layer_selection` 기반 조립 |
 | `metamon_cell` | (layer, role) 마다 argmax. 집중도 대조군 |
 | `weighted_t*` | `softmax(PartialScore / T)` 가중 평균. T 가 크면 soup |
 | `soup` | 균등 평균 |
@@ -245,28 +260,38 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 **한 모델에 몰린 것**의 효과를 분리한다. 둘을 나누지 않으면 패배 원인을
 확정할 수 없다.
 
-`fleet_g - union_g` 는 **데이터량이 같은 짝**이다. 종속성 판정과 충실도 판정이
-모두 이 짝 위에 선다.
+`cm{fleet_size}_{g} - union_g` 는 **데이터량이 같은 짝**이다. 종속성 판정이 이
+짝과 곡선 위에 선다.
+
+`soup` 은 구성상 최고 단일을 못 이긴다. K 개 중 하나만 좋으면 나머지 K-1 개가
+끌어내린다. 실제로 생성에서 `local_0 0.4896 > soup 0.4145` 였다. 그래서 주장 1
+의 arm 은 최고 단일에서 **출발하는** `greedy_soup` / `metamon_greedy` 이고
+`soup` 은 `w/o Selection` ablation 행이다.
 
 ## 비용 (기본 설정, A100 기준)
 
 | 항목 | 수 |
 |---|---|
-| 총 질의 | 2944 (train 2048 / sel 128 / check 256 / test 512) |
+| 총 질의 | 4992 (train 4096 / sel 128 / check 256 / test 512) |
 | Local 하나가 보는 조각 | 256 |
-| `union_g` 가 보는 양 | 512 |
-| 학습할 모델 | 13 (local 8 + union 4 + all 1) |
+| `union_g` 가 보는 양 | 1024 |
+| 학습할 모델 | 21 (local 16 + union 4 + all 1) |
 
 | 실행 | 시간 | 무엇에 비례하는가 |
 |---|---|---|
-| 0 Target | ~1.0h | 질의 수. API 직렬 |
-| 1 fleet | ~1.5h | `n_train` x `lord_epochs` |
-| 2 contribution | ~0.8h | **154 x K x `len(alphas)` x `n_sel`** |
-| 3 evaluate | ~0.7h | arm 수 x `len(scales)` x `n_check` |
+| 0 Target | ~1.7h | 질의 수. API 직렬 |
+| 1 fleet | ~6.0h | `n_train` x `lord_epochs` |
+| 2 contribution | ~1.6h | **154 x K x `len(alphas)` x `n_sel`** |
+| 3 evaluate | ~2.0h | arm 수 x `len(scales)` x `n_check` |
 
-실행 2 가 가장 비싸고, `n_train` 과는 무관하다. 줄여야 하면 `n_sel` 과
+`period_chunk` 를 `acc` 와 같게 둔 뒤 update 수가 4 배가 되었다. 방문 수는
+그대로이므로 생성 비용은 안 늘고, 버려지던 생성이 안 버려진다. 실행 1 이 늘어난
+것은 `k` 와 `n_train` 때문이다.
+
+실행 2 는 `n_train` 과 무관하다. 줄여야 하면 `n_sel` 과
 `alphas` 다. `n_train` 을 줄이면 조각이 얇아져 Local 이 안 붙는다.
 
-`alphas` 를 1 점으로 둔 것은 논문 축이 종속성으로 바뀌었기 때문이다. 주
-결과인 `soup` / `fleet_g` / `union_g` 는 실행 2 를 쓰지 않는다. 기여도 기반
-선택을 본 결과로 쓸 때는 `--alphas 0.125 0.25 0.5` 로 되돌린다.
+`alphas` 를 1 점으로 둔 것은 논문 축이 종속성으로 바뀌었기 때문이다.
+주 결과인 `greedy_soup` 과 종속성 곡선은 실행 2 를 쓰지 않는다. `metamon_greedy`
+는 칸 순서에만 PartialScore 를 쓰므로 격자 1 점으로 충분하다. 기여도 기반
+선택 자체를 본 결과로 쓸 때는 `--alphas 0.125 0.25 0.5` 로 되돌린다.

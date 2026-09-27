@@ -29,9 +29,7 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 
-from .config import Config
-
-METRICS = ("BLEU-1", "BLEU-4", "ROUGE-L", "BERT-F1")
+from .config import METRICS, Config
 
 # sacrebleu 의 13a 토크나이저를 줄인 것. 구두점을 떼고 공백으로 나눈다.
 _PUNCT = re.compile(r"([\.,!?\"';:\(\)\[\]<>/\\])")
@@ -238,3 +236,61 @@ def cost_table(model, cfg: Config, n_query: int, log=print) -> Dict[str, object]
     log(f"  질의          {n_query}")
     log(f"  추론 비용      병합 1배 (모델 1개)  vs  앙상블 {cfg.k}배 (모델 {cfg.k}개)")
     return row
+
+
+# ---------------------------------------------------------------- 생성 비교
+def _rouge_each(hyps: Sequence[str], refs: Sequence[str],
+                beta: float = 1.2) -> List[float]:
+    """질의별 ROUGE-L. 부트스트랩에 쓴다."""
+    out = []
+    for h, r in zip(hyps, refs):
+        ht, rt = tokenize(h), tokenize(r)
+        if not ht or not rt:
+            out.append(0.0)
+            continue
+        l = _lcs(ht, rt)
+        if l == 0:
+            out.append(0.0)
+            continue
+        p, q = l / len(ht), l / len(rt)
+        out.append(((1 + beta ** 2) * p * q) / (q + beta ** 2 * p))
+    return out
+
+
+def text_compare(hyp_a: Sequence[str], hyp_b: Sequence[str],
+                 refs: Sequence[str], tag: str = "", n: int = 2000,
+                 seed: int = 1, log=print) -> Dict[str, tuple]:
+    """같은 질의를 함께 재표집하는 paired bootstrap (Koehn 2004).
+
+    BLEU 는 말뭉치 지표라 질의별로 쪼갤 수 없다. 표본을 다시 뽑아 그 표본에서
+    말뭉치 BLEU 를 다시 계산한다. ROUGE-L 은 문장별 값이 있으므로 그대로 쓴다.
+    지금까지 생성 지표에 구간이 없어서 0.4896 과 0.4145 의 차이가 유의한지
+    말할 수 없었다.
+    """
+    N = len(refs)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, N, (n, N))
+
+    ra = np.asarray(_rouge_each(hyp_a, refs))
+    rb = np.asarray(_rouge_each(hyp_b, refs))
+    d_r = ra - rb
+    s_r = d_r[idx].mean(1)
+
+    d_b = bleu(hyp_a, refs, 4) - bleu(hyp_b, refs, 4)
+    s_b = np.empty(n)
+    for t in range(n if n <= 400 else 400):          # BLEU 재계산은 비싸다
+        j = idx[t]
+        s_b[t] = (bleu([hyp_a[i] for i in j], [refs[i] for i in j], 4)
+                  - bleu([hyp_b[i] for i in j], [refs[i] for i in j], 4))
+    m = min(n, 400)
+    out = {
+        "ROUGE-L": (float(d_r.mean()), float(np.percentile(s_r, 2.5)),
+                    float(np.percentile(s_r, 97.5))),
+        "BLEU-4": (float(d_b), float(np.percentile(s_b[:m], 2.5)),
+                   float(np.percentile(s_b[:m], 97.5))),
+    }
+    if tag:
+        for k, (d, lo, hi) in out.items():
+            v = "양수" if lo > 0 else ("음수" if hi < 0 else "불확실")
+            log(f"  {tag:38s} {k:8s} {d:+.5f}  [{lo:+.5f}, {hi:+.5f}]  {v}")
+    return out

@@ -3,21 +3,16 @@
 
     python run/04_report.py --out runs/gpt35
 
-주장이 둘이다. 둘 다 미리 정한 비교로만 판정한다. 보조 지표로 대신하지 않는다.
+주장이 둘이다. 둘 다 미리 정한 비교로만 판정한다.
 
-  주장 1 (충실도)
-      병합 - 최고 단일 surrogate > 0
-      확률(eq:sim) 에서 양수여야 하고, 생성 문장(BLEU/ROUGE-L) 에서도
-      뒤지지 않아야 한다. 확률만 높고 문장이 안 비슷하면 주장이 아니다.
+  주장 1 (충실도)  병합 - 최고 단일 surrogate > 0
+      **확률과 생성 양쪽에서** 봐야 하고, 최고 단일을 고르는 기준도 보고하는
+      지표와 같아야 한다. avgBF 로 고르면 생성에서 5 위인 Local 이 뽑힌다.
+      확률에서 이기고 생성에서 지면 성립이 아니다. LoRD Table 1 이 생성이다.
 
-  주장 2 (종속성)
-      Dependency(merged) < Dependency(union)
-      둘은 본 데이터가 같다. 차이가 병합 자체의 효과다.
-      union 대조가 없는 숫자는 "데이터를 더 봤을 뿐" 으로 반박당한다.
-
-전체 질의 단일 모델(<fleet>_all) 이 앞서는 것은 한계로 보고하면 된다.
-논지는 "병합이 최선" 이 아니라 "surrogate 를 하나 고르는 것이 불안정하고
-병합이 그 불안정을 없앤다" 이므로 무너지지 않는다.
+  주장 2 (종속성)  병합 크기가 커지면 종속성이 준다
+      cm{m}_{g} 는 겹치지 않는 묶음이다. m 이 커지며 분산이 단조로 줄어야 한다.
+      union_g 대조로 "데이터를 더 봐서 준 것" 을 배제한다.
 """
 from __future__ import annotations
 
@@ -28,165 +23,150 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Pipeline.config import load as load_cfg
-from Pipeline.textgen import METRICS
+from Pipeline.config import METRICS, load as load_cfg
+
+
+def _mark(lo, hi):
+    return "양수" if lo > 0 else ("음수" if hi < 0 else "불확실")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--arm", default="soup",
-                    choices=["soup", "metamon_cell", "metamon_layer", "weighted"])
+    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--arm", default=None)
     a = ap.parse_args()
 
-    cfg = load_cfg(os.path.join(a.out, "ckpt", "config.json"))
+    cfg = load_cfg(os.path.join(a.ckpt or a.out, "ckpt", "config.json"))
     cfg.out_root = a.out
     ev = json.load(open(os.path.join(cfg.log_dir, "03_evaluate.json"),
                         encoding="utf-8"))
-    cmp_ = ev["compare"]
+    cmp_, tcmp = ev["compare"], ev.get("text_compare") or {}
     tm = ev["test_mean"]
-    best_local = ev["best_local"]
-    arm = a.arm
+    best = ev.get("best_local") or {}
+    arm = a.arm or ev.get("arm") or "soup"
 
     if cfg.target_provider == "reference":
-        print("*** Target 이 reference 다. 이 수치는 추출 충실도가 아니다. "
-              "보고하지 말 것.\n")
+        print("*** Target 이 reference 다. 추출 충실도가 아니다. 보고하지 말 것.\n")
 
-    # ------------------------------------------------ 주장 1. 충실도
-    print(f"[주장 1] 병합({arm}) 이 최고 단일 surrogate 보다 Target 을 잘 재현하는가")
-    ok1 = False
-    # 03 이 soup 만 다른 이름으로 남긴다. 태그를 정확히 못 찾으면 접두사로 찾는다.
-    for want in (f"{arm} - best_local", f"{arm} - {cfg.all_name}"):
-        hit = next((k for k in cmp_ if k == want or k.startswith(want + " ")), None)
-        if hit is None:
-            print(f"  {want:34s} 비교 없음")
-            continue
-        d, lo, hi = cmp_[hit]
-        mark = "양수" if lo > 0 else ("음수" if hi < 0 else "불확실")
-        print(f"  eq:sim  {hit:32s} {d:+.5f}  [{lo:+.5f}, {hi:+.5f}]  {mark}")
-        if want.endswith("best_local"):
-            ok1 = lo > 0
+    g = ev.get("greedy") or {}
+    if g:
+        print(f"[greedy] soup 구성 {len(g.get('soup_members', []))}개 "
+              f"{g.get('soup_members')}")
+        print(f"         metamon 시작 {g.get('start')}  "
+              f"칸 {g.get('cells_taken')}/{g.get('cells_tried')} 채택")
 
+    # ------------------------------------------------ 주장 1
+    print(f"\n[주장 1] 병합({arm}) 이 최고 단일 surrogate 를 이기는가")
+    print(f"  최고 단일  avgBF {best.get('sim')}   손실 {best.get('loss')}   "
+          f"생성 {best.get('gen')}")
+
+    print(f"\n  확률 (eq:sim)")
+    ok_sim = {}
+    for tag in ("best_local(sim)", "best_local(loss)", cfg.all_name,
+                "local 평균", "soup"):
+        k = f"{arm} - {tag}"
+        if k in cmp_:
+            d, lo, hi = cmp_[k]
+            ok_sim[tag] = lo > 0
+            print(f"    {k:38s} {d:+.5f}  [{lo:+.5f}, {hi:+.5f}]  {_mark(lo, hi)}")
+
+    print(f"\n  생성 (Target 응답 대비, paired bootstrap)")
+    ok_gen = {}
+    if tcmp:
+        for tag in ("best_local(gen)", "best_local(loss)", cfg.all_name):
+            k = f"{arm} - {tag}"
+            if k in tcmp:
+                for m, (d, lo, hi) in tcmp[k].items():
+                    if m == "ROUGE-L":
+                        ok_gen[tag] = lo > 0
+                    print(f"    {k:30s} {m:8s} {d:+.5f}  "
+                          f"[{lo:+.5f}, {hi:+.5f}]  {_mark(lo, hi)}")
+    else:
+        print("    생성 비교 없음. run/03_evaluate.py --text 로 다시 돌릴 것.")
+
+    claim1 = bool(ok_sim.get("best_local(loss)")) and \
+        bool(ok_gen.get("best_local(gen)"))
+
+    # ------------------------------------------------ 표
     text = ev.get("text") or {}
     victim = ev.get("victim_text") or {}
-    ok_text = None
-    if text and not any("vs_ref" in (v or {}) for v in text.values()):
-        print("  03_evaluate.json 이 옛 형식이다(vs_ref 없음). "
-              "run/03_evaluate.py --text 로 다시 만들 것.")
-        text = {}
-    if text:
+    if text and any("vs_ref" in (v or {}) for v in text.values()):
         head = [m for m in METRICS
                 if any(m in (v.get("vs_ref") or {}) for v in text.values())]
-        label = {"__base__": "Basic theta (Local Model)", "soup": "Uniform Merge",
-                 arm: f"Ours (METAMON, {arm})", cfg.all_name: "All-query LoRD",
-                 best_local: f"Best-Single ({best_local})"}
-
-        def row(nm, key):
-            v = (text.get(nm) or {}).get(key) or {}
-            return "".join(f"{v.get(m, float('nan')):>10.4f}" for m in head)
-
-        # ---- E1. LoRD Table 1 과 같은 축. ref 대비 + Fidelity F
-        print(f"\n  [E1] 데이터셋 정답(ref) 대비 — LoRD Table 1 과 같은 기준")
-        print(f"    {'Method':30s}" + "".join(f"{m:>10s}" for m in head)
-              + f"{'F(ROUGE-L)':>12s}")
-        print(f"    {'Target Model':30s}"
-              + "".join(f"{victim.get(m, float('nan')):>10.4f}" for m in head)
-              + f"{1.0:>12.3f}")
-        order = (["__base__"] + [n for n in text if n.startswith("local_")]
-                 + [n for n in (cfg.all_name, "soup", "metamon_cell",
-                                "metamon_layer") if n in text])
-        for nm in order:
-            if nm not in text:
-                continue
-            f = (text[nm].get("F") or {}).get("ROUGE-L", float("nan"))
-            print(f"    {label.get(nm, nm):30s}" + row(nm, "vs_ref")
-                  + f"{f:>12.3f}")
-
-        # ---- 추출 충실도. Target 응답 대비
-        print(f"\n  [추출 충실도] Target 응답(gold) 대비 — 이쪽이 본 지표")
-        print(f"    {'Method':30s}" + "".join(f"{m:>10s}" for m in head))
-        for nm in order:
-            if nm in text:
-                print(f"    {label.get(nm, nm):30s}" + row(nm, "vs_target"))
-
-        if (text.get(arm) or {}).get("vs_target") and \
-                (text.get(best_local) or {}).get("vs_target"):
-            ok_text = (text[arm]["vs_target"]["ROUGE-L"]
-                       >= text[best_local]["vs_target"]["ROUGE-L"])
-            print(f"    -> Target 대비 ROUGE-L 에서 {arm} 이 best_local 에 "
-                  f"{'앞선다' if ok_text else '뒤진다'}")
-        for nm in (arm, best_local):
+        label = {"__base__": "Basic theta (Local Model)",
+                 "soup": "Uniform Merge", cfg.all_name: "All-query LoRD"}
+        order = ([n for n in text if n.startswith("local_")]
+                 + [n for n in text if not n.startswith("local_")
+                    and n != "__base__"])
+        for key, title in (("vs_ref", "[E1] 데이터셋 정답(ref) 대비 — "
+                                      "LoRD Table 1 과 같은 기준"),
+                           ("vs_target", "[추출 충실도] Target 응답(gold) 대비")):
+            print(f"\n  {title}")
+            print(f"    {'Method':30s}" + "".join(f"{m:>10s}" for m in head)
+                  + (f"{'F(ROUGE-L)':>12s}" if key == "vs_ref" else ""))
+            if key == "vs_ref" and victim:
+                print(f"    {'Target Model':30s}"
+                      + "".join(f"{victim.get(m, float('nan')):>10.4f}"
+                                for m in head) + f"{1.0:>12.3f}")
+            for nm in ["__base__"] + order:
+                v = (text.get(nm) or {}).get(key)
+                if not v:
+                    continue
+                f = (text[nm].get("F") or {}).get("ROUGE-L", float("nan"))
+                print(f"    {label.get(nm, nm):30s}"
+                      + "".join(f"{v.get(m, float('nan')):>10.4f}" for m in head)
+                      + (f"{f:>12.3f}" if key == "vs_ref" else ""))
+        for nm in (arm, best.get("gen")):
             for s in (text.get(nm, {}).get("sample") or [])[:1]:
                 print(f"    [{nm} 예시]")
-                print(f"      Target    {s['target'][:88]}")
-                print(f"      ref       {str(s.get('ref',''))[:88]}")
-                print(f"      surrogate {s['surrogate'][:88]}")
-    else:
-        print("  생성 비교 없음. run/03_evaluate.py --text 로 다시 돌릴 것.")
+                print(f"      Target    {s['target'][:86]}")
+                print(f"      surrogate {s['surrogate'][:86]}")
 
-    # ------------------------------------------------ 주장 2. 종속성
+    # ------------------------------------------------ 주장 2
+    print(f"\n[주장 2] 병합 크기가 커지면 surrogate 선택 의존이 주는가")
+    cv = ev.get("dependency_curve") or {}
+    rows = cv.get("rows") or []
+    claim2 = False
+    if rows:
+        print(f"    {'m':>3s} {'묶음':>4s} {'분산':>11s} {'평균':>9s}")
+        for r in rows:
+            print(f"    {r['m']:3d} {r['n']:4d} {r['var']:11.3e} {r['mean']:9.5f}")
+        f0, fl = rows[0], rows[-1]
+        print(f"    m={f0['m']} -> m={fl['m']}  "
+              f"{f0['var'] / max(fl['var'], 1e-30):.1f}배 감소   "
+              f"{'단조 감소' if cv.get('monotone') else '단조가 아니다'}")
+        claim2 = bool(cv.get("monotone")) and fl["var"] < f0["var"]
     dep = ev.get("dependency") or {}
-    print(f"\n[주장 2] 병합이 surrogate 선택 의존을 줄이는가")
-    ok2 = bool(dep.get("ok"))
-    if dep:
-        for tag, key in (("single  (조각 1개, 병합 없음)", "single"),
-                         (f"union   (조각 {cfg.fleet_size}개, 병합 없음)", "union"),
-                         (f"merged  (조각 {cfg.fleet_size}개, 병합 있음)", "merged"),
-                         ("loo     (겹침, 판정 제외)", "loo")):
-            v = dep.get(key)
-            if v is not None:
-                print(f"  Dependency {tag:34s} {v:.3e}")
-        u, m = dep.get("union"), dep.get("merged")
-        if u and m:
-            print(f"  merged < union  {'성립' if ok2 else '불성립'}  "
-                  f"({u / max(m, 1e-30):.1f}배)")
-        n_f = len(dep.get("values", {}).get("merged", []))
-        if n_f < 3:
-            print(f"  *** merged 가 {n_f} 개뿐이다. 분산 추정이 얇다.")
-        # 데이터량을 맞춘 짝별 충실도
-        pos = sum(1 for g in range(cfg.n_fleet)
-                  if cmp_.get(f"fleet_{g} - union_{g} (데이터 동일)", [0, 0, 0])[1] > 0)
-        print(f"  같은 데이터에서 fleet > union 인 묶음 {pos}/{cfg.n_fleet}")
-    else:
-        print("  종속성 결과가 없다.")
+    if dep.get("union") and dep.get("merged"):
+        print(f"    데이터량 대조  union {dep['union']:.3e}  "
+              f"merged {dep['merged']:.3e}  "
+              f"{'merged 가 작다' if dep['merged'] < dep['union'] else '불성립'}")
+        pos = sum(1 for k, v in cmp_.items()
+                  if k.startswith(f"cm{cfg.fleet_size}_") and "union" in k
+                  and v[1] > 0)
+        print(f"    같은 데이터에서 병합이 이긴 묶음 {pos}/{cfg.n_fleet}")
 
     # ------------------------------------------------ 비용
     c = ev.get("cost") or {}
     if c:
-        print(f"\n[비용]")
-        print(f"  surrogate {c['surrogate']}  {c['surrogate_params']/1e9:.2f}B")
-        print(f"  Target    {c['target']}")
-        print(f"  질의      {c['queries_total']}")
-        print(f"  추론      병합 {c['inference_merged']}배(모델 1개)  vs  "
-              f"앙상블 {c['inference_ensemble']}배(모델 {c['models_kept_ensemble']}개)")
+        print(f"\n[비용]  surrogate {c['surrogate_params']/1e9:.2f}B  "
+              f"Target {c['target']}  질의 {c['queries_total']}  "
+              f"추론 병합 1배 vs 앙상블 {c['inference_ensemble']}배")
     if ev.get("ensemble_mean"):
-        print(f"  앙상블 test {ev['ensemble_mean']:.5f}  vs  "
-              f"{arm}(비용 1배) {tm.get(arm, float('nan')):.5f}")
-
-    # ------------------------------------------------ 한계
-    print(f"\n[한계로 보고할 것]")
-    t = f"{arm} - {cfg.all_name}"
-    if t in cmp_:
-        d, lo, hi = cmp_[t]
-        print(f"  {t:34s} {d:+.5f}  [{lo:+.5f}, {hi:+.5f}]"
-              + ("  전체 질의 단일 모델이 앞선다" if hi < 0 else ""))
-    print(f"  구간은 고정된 checkpoint 의 표본 불확실성이다. "
-          f"학습 시드 반복을 대신하지 않는다.")
+        print(f"       앙상블 {ev['ensemble_mean']:.5f}  vs  "
+              f"{arm}(1배) {tm.get(arm, float('nan')):.5f}")
 
     # ------------------------------------------------ 결론
     print(f"\n[결론]")
-    if ok1 and ok2:
-        print("  두 주장 모두 성립. 시드 반복과 두 번째 과제(subset) 로 확장할 단계.")
-    elif ok2 and not ok1:
-        print("  종속성만 성립. 충실도 개선은 주장에서 빼고 종속성 완화 단독으로 쓸 것.")
-    elif ok1 and not ok2:
-        print("  충실도만 성립. 종속성은 union 대조를 통과하지 못했다. "
-              "n_fleet 을 늘리거나 주장을 충실도로 좁힐 것.")
-    else:
-        print("  둘 다 성립하지 않는다. 설정을 바꾸기 전에 fleet 학습 로그부터 볼 것.")
-    if text and ok_text is False:
-        print("  생성 문장에서 뒤진다. 확률만 높은 상태이므로 "
-              "'비슷한 답변을 낸다' 는 주장은 아직 못 한다.")
+    print(f"  주장 1 (충실도)   {'성립' if claim1 else '불성립'}"
+          + ("" if claim1 else "   확률과 생성 양쪽에서 최고 단일을 이겨야 한다"))
+    print(f"  주장 2 (종속성)   {'성립' if claim2 else '불성립'}"
+          + ("" if claim2 else "   병합 크기에 따라 분산이 단조로 줄어야 한다"))
+    if claim1 and claim2:
+        print("  둘 다 성립. 시드 반복과 두 번째 subset 으로 확장할 단계.")
+    print(f"  구간은 고정된 checkpoint 의 표본 불확실성이다. "
+          f"학습 시드 반복을 대신하지 않는다.")
 
 
 if __name__ == "__main__":

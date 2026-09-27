@@ -44,8 +44,9 @@ def surrogate_dependency(res: Dict[str, ArmResult], cfg: Config, log=print
     """세 집합의 종속성. 판정은 union 대 merged 로 한다."""
     single = [res[n].test_mean for n in cfg.local_names]
     union = [res[n].test_mean for n in cfg.union_names if n in res]
-    merged = [res[f"fleet_{g}"].test_mean for g in range(cfg.n_fleet)
-              if f"fleet_{g}" in res]
+    merged = [res[f"cm{cfg.fleet_size}_{g}"].test_mean
+              for g in range(cfg.n_fleet)
+              if f"cm{cfg.fleet_size}_{g}" in res]
     loo = [res[f"loo_{i}"].test_mean for i in range(cfg.k) if f"loo_{i}" in res]
 
     log("[Surrogate Dependency]  분산이 작을수록 surrogate 선택에 덜 휘둘린다")
@@ -72,6 +73,41 @@ def surrogate_dependency(res: Dict[str, ArmResult], cfg: Config, log=print
             "loo": d_loo, "ok": ok,
             "values": {"single": single, "union": union,
                        "merged": merged, "loo": loo}}
+
+
+def dependency_curve(res: Dict[str, ArmResult], cfg: Config, log=print) -> dict:
+    """병합 크기 m 에 따른 종속성.
+
+    m = 1 은 개별 Local 이고, m 이 커질수록 묶음 수가 줄어든다. 묶음끼리는
+    구성원이 겹치지 않으므로 leave-one-out 처럼 "겹쳐서 분산이 준" 것이
+    아니다. 크기가 커지며 분산이 단조로 줄면 그것이 종속성 완화의 증거다.
+
+    fleet_size 를 2 로 두고 한 점만 보면 뒤집힌다(좋은 것과 나쁜 것을 1:1 로
+    섞으면 희석이 안 된다). 곡선으로 봐야 한다.
+    """
+    rows = []
+    for m in cfg.curve:
+        vals = [res[f"cm{m}_{g}"].test_mean for g in range(cfg.k // m)
+                if f"cm{m}_{g}" in res]
+        if len(vals) < 2:
+            continue
+        rows.append({"m": m, "n": len(vals), "var": dependency(vals),
+                     "mean": float(np.mean(vals)), "values": vals})
+    if not rows:
+        log("[종속성 곡선] arm 이 없다. cfg.curve 를 확인할 것.")
+        return {"rows": [], "monotone": False}
+
+    log("[종속성 곡선]  병합 크기 m 별 분산. 묶음끼리 구성원이 겹치지 않는다.")
+    log(f"  {'m':>3s} {'묶음':>4s} {'분산':>11s} {'평균':>9s}   값")
+    for r in rows:
+        log(f"  {r['m']:3d} {r['n']:4d} {r['var']:11.3e} {r['mean']:9.5f}   "
+            f"{[round(v, 4) for v in r['values']]}")
+    mono = all(rows[i]["var"] >= rows[i + 1]["var"] for i in range(len(rows) - 1))
+    first, last = rows[0], rows[-1]
+    log(f"  m={first['m']} -> m={last['m']}  분산 "
+        f"{first['var'] / max(last['var'], 1e-30):.1f}배 감소   "
+        f"{'단조 감소' if mono else '단조가 아니다'}")
+    return {"rows": rows, "monotone": mono}
 
 
 def output_ensemble(ws: WeightSpace, cfg: Config, sources, res: Dict[str, ArmResult],

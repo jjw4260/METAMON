@@ -10,7 +10,10 @@ import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from typing import List
+from typing import List, Tuple
+
+# 보고 지표. LoRD §5 와 같다.
+METRICS: Tuple[str, ...] = ("BLEU-1", "BLEU-4", "ROUGE-L", "BERT-F1")
 
 
 @dataclass
@@ -35,7 +38,7 @@ class Config:
     target_temperature: float = 1.0
     target_max_tokens: int = 128
     target_base_url: str = ""            # OpenAI 호환 다른 제공자
-    query_budget: int = 4096             # 실제로 보내는 신규 질의 상한
+    query_budget: int = 4992             # 실제로 보내는 신규 질의 상한
     dataset_file: str = "target/dataset.json"
     cache_file: str = "target/cache.jsonl"
 
@@ -43,13 +46,13 @@ class Config:
     # 학습이 붙는 것을 확인했으므로 건드리지 않는다.
     # n_sel 은 실행 2 의 비용을 그대로 곱한다. 실행 2 는
     #   154칸 x K후보 x |alphas| 번 sel 전체를 다시 잰다.
-    n_train: int = 2048
+    n_train: int = 4096
     n_sel: int = 128
     n_check: int = 256
     n_test: int = 512
 
     # ---------------- fleet ----------------
-    k: int = 8                     # Local Model 수
+    k: int = 16                    # Local Model 수
     shard: str = "disjoint"        # "disjoint" | "bootstrap"
     fleet_method: str = "lord"     # "lord" | "sft"
     # 독립 fleet 대조. k 개를 fleet_size 개씩 겹치지 않게 묶는다.
@@ -57,7 +60,14 @@ class Config:
     #   Dependency(union)   조각 fleet_size 개를 합쳐 학습한 단일 모델. 병합 없음
     #   Dependency(merged)  같은 조각들을 학습 후 병합. 병합 있음
     # union 과 merged 는 본 데이터가 같다. 둘의 차이가 병합 자체의 효과다.
-    fleet_size: int = 2
+    #
+    # fleet_size = 2 로 재 보니 merged 의 분산이 오히려 커졌다. 좋은 Local 과
+    # 나쁜 Local 을 1:1 로 섞으면 희석이 안 되기 때문이다(구성원 둘보다 낮은
+    # 묶음이 나왔다). 반면 7 개를 합친 loo 는 분산이 1/92 였다. 그래서 단일
+    # 비교 대신 **병합 크기별 곡선**으로 본다. curve_sizes 의 각 m 에 대해
+    # k 개를 m 개씩 겹치지 않게 묶어 분산을 잰다.
+    fleet_size: int = 4
+    curve_sizes: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
 
     # ---------------- LoRD (LoRD-VI = 논문이 보고하는 방법) ----------------
     # lord_train.py:1109  "LoRD-VI" -> from train_pod2 import train
@@ -90,7 +100,13 @@ class Config:
     # 다 보지 못한 채로 끝나 비교가 깨진다.
     periods: int = 0
     lord_epochs: int = 2
-    period_chunk: int = 32         # period 당 질의 수. 자주 재표집한다
+    # period 당 질의 수. acc 와 같게 두는 것이 중요하다.
+    #   chunk > acc 이면 period break 가 첫 update 에서 걸릴 때 나머지 질의의
+    #   생성 결과가 통째로 버려진다. chunk 32, acc 8 로 돌렸더니 계획한 64
+    #   update 중 16 만 돌았고 질의 절반은 학습에 한 번도 안 들어갔다.
+    #   chunk = acc 면 방문 수(periods x chunk)가 같은 채로 update 가 4 배다.
+    #   LoRD 원본도 sub_set_num=1 로 질의 하나마다 재표집한다.
+    period_chunk: int = 8
 
     # ---------------- SFT (대조군 fleet) ----------------
     sft_lr: float = 1e-5
@@ -176,8 +192,18 @@ class Config:
     @property
     def fleets(self) -> List[List[int]]:
         """겹치지 않는 Local 묶음. 독립 fleet 종속성 대조에 쓴다."""
-        s = self.fleet_size
-        return [list(range(g * s, (g + 1) * s)) for g in range(self.n_fleet)]
+        return self.fleets_of(self.fleet_size)
+
+    def fleets_of(self, m: int) -> List[List[int]]:
+        """k 개를 m 개씩 겹치지 않게 묶는다. 종속성 곡선의 한 점."""
+        m = max(1, min(m, self.k))
+        return [list(range(g * m, (g + 1) * m)) for g in range(self.k // m)]
+
+    @property
+    def curve(self) -> List[int]:
+        """실제로 쓸 병합 크기. k 를 나누고 묶음이 2 개 이상인 것만."""
+        return [m for m in self.curve_sizes
+                if self.k % m == 0 and self.k // m >= 2]
 
     @property
     def union_names(self) -> List[str]:
