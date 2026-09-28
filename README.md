@@ -303,7 +303,10 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 1. 설정 해시 - 기존 checkpoint 와 설정이 다르면 중단
 1.5 조각 치우침 - 두 축 어느 쪽도 갈리지 않으면 중단 (`--allow-iid` 로 뚫는다)
 2. 학습-평가 중복 - 0 이 아니면 중단
-3. arm 생존 - 배율 1.0/0.5 중 어느 것도 BASE 를 개선하지 못하면 중단
+3. arm 생존 - 비-IID local 은 **자기 조각**에서, union / all 은 전체 혼합
+   `sel` 에서 본다. local 이 전체 혼합에서 못 오르는 것은 좁게 배운 설계의
+   결과이므로 기록만 하고 넘어간다. 자기 조각에서도 못 오른 local 이 4 개면
+   학습 자체가 고장난 것이므로 중단한다. union / all 은 한 번이라도 실패하면 중단
 4. 저장/복원 - 질의별 log-probability 차이가 1e-4 이상이면 중단
 5. 다양성 - 칸별 코사인 중앙값이 `cos_max` 를 넘으면 중단 (합칠 것이 없다)
 6. 통합 검증 - `eq:assembly_verification` 실패 시 greedy 복구

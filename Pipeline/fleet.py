@@ -29,6 +29,11 @@ def build_fleet(ws: WeightSpace, tok, cfg: Config, sp: Splits,
     ws.reset()
     base_loss = loss(ws.model, sel)
     log(f"[fleet] {cfg.fleet_method}.  base L(theta;1) = {base_loss:.5f}")
+    iid = cfg.shard in ("iid", "disjoint", "bootstrap")
+    if not iid:
+        log(f"  조각이 비-IID({cfg.shard}) 다. local 의 생존은 **자기 조각**에서")
+        log(f"  본다. 전체 혼합 sel 에서 못 오르는 것은 정상이고 기록만 한다.")
+    failed: List[str] = []
 
     def health() -> float:
         return loss(ws.model, sel)
@@ -40,8 +45,27 @@ def build_fleet(ws: WeightSpace, tok, cfg: Config, sp: Splits,
         idx, seed = _assignment(cfg, sp, name)
         data = sp.train if idx is None else [sp.train[i] for i in idx]
         log(f"  {name} 학습 질의 {len(data)}")
+
+        # 비-IID local 은 자기 조각에서 재는 것이 맞는 건강 검사다. 좁게 배운
+        # 모델이 전체 혼합에서 안 오르는 것은 고장이 아니라 그 설계의 결과다.
+        own = None
+        if not iid and name in cfg.local_names:
+            own = EvalSet(data, tok, ws.device, cfg.eval_bs)
+            ws.reset()
+            base_own = loss(ws.model, own)
+
         trainer(ws, tok, cfg, name, data, seed, health=health, log=log)
-        _gate(ws, cfg, sel, name, base_loss, log)
+        ok = _gate(ws, cfg, sel, name, base_loss, log,
+                   own=own, base_own=base_own if own is not None else None)
+        if not ok:
+            failed.append(name)
+        if len(failed) >= 4:
+            raise SystemExit(
+                f"local {len(failed)}개가 자기 조각에서도 개선이 없다: {failed}\n"
+                f"학습 자체가 고장났다. lord_variant / lord_lr / period_chunk 를 볼 것.")
+    if failed:
+        log(f"\n  *** 생존 관문을 못 넘은 arm {failed}. 조립에는 들어가지만")
+        log(f"      기여도 점유가 0 에 가까울 것이다.")
     ws.reset()
 
 
@@ -63,20 +87,45 @@ def _assignment(cfg: Config, sp: Splits, name: str):
 
 
 def _gate(ws: WeightSpace, cfg: Config, sel: EvalSet, name: str,
-          base_loss: float, log) -> None:
+          base_loss: float, log, own: EvalSet | None = None,
+          base_own: float | None = None) -> bool:
+    """생존 관문. 통과 여부를 돌려준다.
+
+    `own` 이 있으면(비-IID local) **자기 조각**이 판정 기준이고 전체 혼합 sel
+    은 참고로만 찍는다. 좁게 배운 모델이 전체에서 안 오르는 것은 고장이 아니라
+    설계의 결과다. `own` 이 없으면(union / all / IID local) 전체 혼합이 기준이며
+    거기서 못 오르면 학습이 고장난 것이므로 그 자리에서 멈춘다.
+    """
     state = torch.load(ckpt_path(cfg, name), map_location="cpu")
     delta = {k: state[k].float() - ws.base[k].cpu() for k in ws.keys}
-    best = None
+    best, best_own = None, None
     for s in (1.0, 0.5):
         ws.apply(lambda k: delta[k], s)
         v = loss(ws.model, sel)
         best = v if best is None else min(best, v)
+        if own is not None:
+            w = loss(ws.model, own)
+            best_own = w if best_own is None else min(best_own, w)
     ws.reset()
+
+    if own is not None:
+        ok = best_own < base_own
+        log(f"  {name} 생존 자기조각 {best_own:.5f} vs base {base_own:.5f}  "
+            f"{'통과' if ok else '실패'}   "
+            f"(전체 sel {best:.5f} vs {base_loss:.5f} "
+            f"{'+' if best < base_loss else '-'})")
+        if not ok:
+            log(f"    *** 자기 조각에서도 개선이 없다. 학습이 안 붙었다.")
+        return ok
+
+    ok = best < base_loss
     log(f"  {name} 생존 L@1.0/0.5 최소 {best:.5f}  vs base {base_loss:.5f}  "
-        f"{'통과' if best < base_loss else '실패'}")
-    if best >= base_loss:
+        f"{'통과' if ok else '실패'}")
+    if not ok:
         raise SystemExit(
-            f"{name}: 학습이 BASE 를 개선하지 못했다. 다음 arm 으로 넘어가지 않는다.")
+            f"{name}: 전체 질의로 학습했는데 BASE 를 개선하지 못했다. "
+            f"학습이 고장났다. 다음 arm 으로 넘어가지 않는다.")
+    return True
 
 
 def load_deltas(ws: WeightSpace, cfg: Config, log=print
