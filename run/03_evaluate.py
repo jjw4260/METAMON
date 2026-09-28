@@ -208,92 +208,161 @@ def main() -> None:
 
     # ---------------------------------------------------------------- 텍스트
     text, victim, tcmp, oc_gen = {}, None, {}, None
-    if a.text:
-        pool = sp.test[: cfg.text_n] if cfg.text_n else sp.test
-        cpool = sp.check[: cfg.text_n] if cfg.text_n else sp.check
-        gold = [x["gold"].strip() for x in pool]
-        ref = [str(x["ref"]).strip() for x in pool]
-        cgold = [x["gold"].strip() for x in cpool]
-
-        def gen(nm, items):
-            if nm == "__base__":
-                ws.reset()
-            else:
-                ws.apply(src[nm], res[nm].scale if nm in res else 1.0)
-            h = generate(ws.model, tok, items, cfg, device)
-            ws.reset()
-            torch.cuda.empty_cache()
-            return h
-
-        # ---- best_gen: check 에서 생성으로 고른다. test 를 보고 고르면 안 된다.
-        print(f"\n[생성] check {len(cpool)} 질의로 최고 단일을 고른다")
-        from Pipeline.textgen import _rouge_each
-        ck_gen = {n: float(np.mean(_rouge_each(gen(n, cpool), cgold)))
-                  for n in cfg.local_names}
-        best["gen"] = max(cfg.local_names, key=lambda n: ck_gen[n])
-        for n in cfg.local_names:
-            print(f"    {n:10s} check ROUGE-L {ck_gen[n]:.4f}"
-                  + ("   <- 최고" if n == best["gen"] else ""))
-
-        arms = (["__base__"] + cfg.local_names + ours
-                + [cfg.all_name, "metamon_cell", "soup_raw",
-                   f"weighted_t{best_tau}"])
-        arms = [n for i, n in enumerate(arms) if n not in arms[:i]]
-        print(f"\n[텍스트] test {len(pool)} 질의 생성 "
-              f"({'greedy' if cfg.text_temp <= 0 else f'T={cfg.text_temp}'})   "
-              f"BERTScore {cfg.bert_score_model or '끔'}")
-        victim = victim_scores(gold, ref, cfg)
-        hyps = {}
-        for nm in arms:
-            if nm != "__base__" and nm not in src:
-                continue
-            hyps[nm] = gen(nm, pool)
-            text[nm] = score_text(hyps[nm], gold, ref, cfg, victim=victim, tag=nm)
-            text[nm]["sample"] = [
-                {"prompt": pool[i]["prompt"], "target": gold[i],
-                 "ref": ref[i], "surrogate": hyps[nm][i]}
-                for i in range(min(3, len(pool)))]
-
-        print(f"\n[생성 비교] paired bootstrap 95%  (Target 응답 대비)")
-        for nm in ours:
-            for tag, other in (("best_local(gen)", best["gen"]),
-                               ("best_local(loss)", best["loss"]),
-                               (cfg.all_name, cfg.all_name)):
-                if nm in hyps and other in hyps and nm != other:
-                    tcmp[f"{nm} - {tag}"] = text_compare(
-                        hyps[nm], hyps[other], gold, tag=f"{nm} - {tag}")
-
-        # 생성에서의 상보성. 지난 실행이 깨진 곳이 여기라 이 수가 본 진단이다.
-        rq = {n: _rouge_each(hyps[n], gold) for n in cfg.local_names
-              if n in hyps}
-        if len(rq) == cfg.k:
-            oc_gen = complementarity(
-                rq, cfg.local_names, best["gen"],
-                arms={n: _rouge_each(hyps[n], gold) for n in ours if n in hyps})
-            oracle_report(oc_gen, "생성 (ROUGE-L, Target 응답 대비)", cfg.k)
+    text_state = {"text": {}, "victim": None, "tcmp": {}, "oc_gen": None,
+                  "best": best, "hyps_path":
+                  os.path.join(cfg.log_dir, "03_hyps.json"),
+                  "query_hash": sp.query_hash()}
 
     cost = cost_table(ws.model, cfg, len(sp.all))
+    skew = sp.skew(cfg)
 
-    out = {
-        "arm": arm, "best_local": best, "best_tau": best_tau,
-        "check_loss": ck_loss, "greedy": greedy_info,
-        "scale": {n: r.scale for n, r in res.items() if r.curve},
-        "check": {n: r.check for n, r in res.items() if r.curve},
-        "test_mean": {n: r.test_mean for n, r in res.items()},
-        "test_per_query": {n: list(map(float, r.test)) for n, r in res.items()},
-        "curves": {n: r.curve for n, r in res.items() if r.curve},
-        "compare": {k: list(v) for k, v in table.items()},
-        "text_compare": {k: {m: list(v) for m, v in d.items()}
-                         for k, d in tcmp.items()},
-        "dependency": dep, "dependency_curve": curve,
-        "oracle_sim": oc_sim, "oracle_gen": oc_gen,
-        "shard_skew": sp.skew(cfg),
-        "text": text, "victim_text": victim, "cost": cost,
-        "ensemble_mean": ens_mean,
-    }
-    path = os.path.join(cfg.log_dir, "03_evaluate.json")
-    json.dump(out, open(path, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    def save() -> str:
+        """지금까지 나온 것을 전부 저장한다. 텍스트 단계에서 죽어도 확률
+        결과는 남는다. 생성은 비싸므로 hyps 를 따로 캐시한다."""
+        out = {
+            "arm": arm, "best_local": best, "best_tau": best_tau,
+            "check_loss": ck_loss, "greedy": greedy_info,
+            "scale": {n: r.scale for n, r in res.items() if r.curve},
+            "check": {n: r.check for n, r in res.items() if r.curve},
+            "test_mean": {n: r.test_mean for n, r in res.items()},
+            "test_per_query": {n: list(map(float, r.test)) for n, r in res.items()},
+            "curves": {n: r.curve for n, r in res.items() if r.curve},
+            "compare": {k: list(v) for k, v in table.items()},
+            "text_compare": {k: {m: list(v) for m, v in d.items()}
+                             for k, d in tcmp.items()},
+            "dependency": dep, "dependency_curve": curve,
+            "oracle_sim": oc_sim, "oracle_gen": oc_gen,
+            "shard_skew": skew,
+            "text": text, "victim_text": victim, "cost": cost,
+            "ensemble_mean": ens_mean,
+        }
+        p = os.path.join(cfg.log_dir, "03_evaluate.json")
+        json.dump(out, open(p, "w", encoding="utf-8"), indent=2,
+                  ensure_ascii=False)
+        return p
+
+    # 텍스트 단계 전에 한 번 저장한다. 생성에서 무슨 일이 나도 확률 결과와
+    # 종속성 곡선은 이미 디스크에 있다.
+    print(f"\n중간 저장: {save()}")
+
+    # ---------------------------------------------------------------- 텍스트
+    if a.text:
+        try:
+            _text_stage(ws, tok, cfg, sp, src, res, best, ours, arm, device,
+                        best_tau, text_state)
+        except Exception:
+            import traceback
+            print("\n*** 텍스트 단계가 실패했다. 확률 결과는 이미 저장돼 있다.")
+            traceback.print_exc()
+        text = text_state["text"]
+        victim = text_state["victim"]
+        tcmp = text_state["tcmp"]
+        oc_gen = text_state["oc_gen"]
+        best = text_state["best"]
+
+    path = save()
     print(f"\n저장: {path}")
+
+
+def _text_stage(ws, tok, cfg, sp, src, res, best, ours, arm, device,
+                best_tau, st) -> None:
+    """생성과 텍스트 지표. 생성 결과는 디스크에 캐시한다.
+
+    생성이 이 단계 비용의 대부분이다. 뒤에서 무엇이 터지든 다시 생성하지
+    않도록 hyps 를 먼저 저장하고, 다시 돌릴 때 같은 질의면 그대로 읽는다.
+    """
+    from Pipeline.textgen import _rouge_each
+    pool = sp.test[: cfg.text_n] if cfg.text_n else sp.test
+    cpool = sp.check[: cfg.text_n] if cfg.text_n else sp.check
+    gold = [x["gold"].strip() for x in pool]
+    ref = [str(x["ref"]).strip() for x in pool]
+    cgold = [x["gold"].strip() for x in cpool]
+
+    def gen(nm, items):
+        if nm == "__base__":
+            ws.reset()
+        else:
+            ws.apply(src[nm], res[nm].scale if nm in res else 1.0)
+        h = generate(ws.model, tok, items, cfg, device)
+        ws.reset()
+        torch.cuda.empty_cache()
+        return h
+
+    arms = (["__base__"] + cfg.local_names + ours
+            + [cfg.all_name, "metamon_cell", "soup_raw",
+               f"weighted_t{best_tau}"])
+    arms = [n for i, n in enumerate(arms) if n not in arms[:i]]
+
+    # ---- 캐시. 같은 질의에 대해 이미 생성해 둔 것이 있으면 다시 안 만든다.
+    cache = {}
+    if os.path.exists(st["hyps_path"]):
+        try:
+            c = json.load(open(st["hyps_path"], encoding="utf-8"))
+            if c.get("query_hash") == st["query_hash"]:
+                cache = c
+                print(f"\n[생성 캐시] {st['hyps_path']} 사용. "
+                      f"arm {len(c.get('hyps', {}))}개, check {len(c.get('ck_gen', {}))}개")
+        except Exception:
+            cache = {}
+
+    ck_gen = cache.get("ck_gen") or {}
+    if len(ck_gen) < cfg.k:
+        print(f"\n[생성] check {len(cpool)} 질의로 최고 단일을 고른다")
+        for n in cfg.local_names:
+            if n not in ck_gen:
+                ck_gen[n] = float(np.mean(_rouge_each(gen(n, cpool), cgold)))
+    best["gen"] = max(cfg.local_names, key=lambda n: ck_gen[n])
+    for n in cfg.local_names:
+        print(f"    {n:10s} check ROUGE-L {ck_gen[n]:.4f}"
+              + ("   <- 최고" if n == best["gen"] else ""))
+
+    print(f"\n[텍스트] test {len(pool)} 질의 생성 "
+          f"({'greedy' if cfg.text_temp <= 0 else f'T={cfg.text_temp}'})   "
+          f"BERTScore {cfg.bert_score_model or '끔'}")
+    hyps = dict(cache.get("hyps") or {})
+    todo = [n for n in arms if n not in hyps and (n == "__base__" or n in src)]
+    for nm in todo:
+        hyps[nm] = gen(nm, pool)
+        # 한 arm 끝날 때마다 저장한다. 중간에 끊겨도 거기까지는 산다.
+        json.dump({"query_hash": st["query_hash"], "hyps": hyps,
+                   "ck_gen": ck_gen},
+                  open(st["hyps_path"], "w", encoding="utf-8"),
+                  ensure_ascii=False)
+    print(f"  생성 완료 {len(hyps)}개 arm   캐시 {st['hyps_path']}")
+
+    victim = victim_scores(gold, ref, cfg)
+    st["victim"] = victim
+    text = {}
+    for nm in arms:
+        if nm not in hyps:
+            continue
+        text[nm] = score_text(hyps[nm], gold, ref, cfg, victim=victim, tag=nm)
+        text[nm]["sample"] = [
+            {"prompt": pool[i]["prompt"], "target": gold[i],
+             "ref": ref[i], "surrogate": hyps[nm][i]}
+            for i in range(min(3, len(pool)))]
+    st["text"] = text
+
+    # ---- 생성에서의 상보성. 이 수가 본 진단이므로 비교보다 먼저 낸다.
+    rq = {n: _rouge_each(hyps[n], gold) for n in cfg.local_names if n in hyps}
+    if len(rq) == cfg.k:
+        st["oc_gen"] = complementarity(
+            rq, cfg.local_names, best["gen"],
+            arms={n: _rouge_each(hyps[n], gold) for n in ours if n in hyps})
+        oracle_report(st["oc_gen"], "생성 (ROUGE-L, Target 응답 대비)", cfg.k)
+
+    print(f"\n[생성 비교] paired bootstrap 95%  (Target 응답 대비)")
+    tcmp = {}
+    for nm in ours:
+        for tag, other in (("best_local(gen)", best["gen"]),
+                           ("best_local(loss)", best["loss"]),
+                           (cfg.all_name, cfg.all_name)):
+            if nm in hyps and other in hyps and nm != other:
+                tcmp[f"{nm} - {tag}"] = text_compare(
+                    hyps[nm], hyps[other], gold, tag=f"{nm} - {tag}")
+    st["tcmp"] = tcmp
+    st["best"] = best
+
 
 
 if __name__ == "__main__":

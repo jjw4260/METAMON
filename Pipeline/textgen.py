@@ -27,6 +27,7 @@ import re
 from collections import Counter
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
 import torch
 
 from .config import METRICS, Config
