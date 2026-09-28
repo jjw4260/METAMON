@@ -46,6 +46,7 @@ from Pipeline.evaluate import ArmResult, compare, mean_of, run_all
 from Pipeline.fleet import load_deltas
 from Pipeline.metrics import EvalSet, loss, paired_bootstrap, sim, verdict
 from Pipeline.modeling import WeightSpace, load_tokenizer, setup_precision
+from Pipeline.oracle import complementarity, report as oracle_report
 from Pipeline.textgen import (cost_table, generate, score_text,
                               text_compare, victim_scores)
 from Pipeline.weightspace import Candidates
@@ -129,6 +130,11 @@ def main() -> None:
     print(f"  avgBF 기준   {best['sim']}   check {res[best['sim']].check:.5f}")
     print(f"  손실 기준    {best['loss']}   check L {ck_loss[best['loss']]:.5f}")
 
+    # ---- 상보성. 뽑을 것이 있는지부터 본다. headroom 이 0 이면 그 뒤가 무의미하다.
+    oc_sim = complementarity({n: res[n].test for n in cfg.local_names},
+                             cfg.local_names, best["loss"])
+    oracle_report(oc_sim, "확률 (eq:sim)", cfg.k)
+
     # ---------------------------------------------------------------- 2 단계
     # greedy 계열은 1 단계 결과(순서, 시작점)가 있어야 만들 수 있다.
     greedy_info = {}
@@ -159,6 +165,12 @@ def main() -> None:
     arm = a.arm if a.arm in res else "soup"
     ours = [n for n in ("greedy_soup", "metamon_greedy", "soup",
                         "metamon_layer", "weighted") if n in res]
+
+    # 회수율까지 포함해 다시 낸다. headroom 의 몇 %를 기전이 가져왔는가.
+    oc_sim = complementarity({n: res[n].test for n in cfg.local_names},
+                             cfg.local_names, best["loss"],
+                             arms={n: res[n].test for n in ours})
+    oracle_report(oc_sim, "확률 (eq:sim) — 회수율 포함", cfg.k)
 
     # ---------------------------------------------------------------- 비교
     print(f"\n[결과] test {len(sp.test)} 질의, paired bootstrap 95%   "
@@ -195,7 +207,7 @@ def main() -> None:
         ens_mean = float(np.mean(ens))
 
     # ---------------------------------------------------------------- 텍스트
-    text, victim, tcmp = {}, None, {}
+    text, victim, tcmp, oc_gen = {}, None, {}, None
     if a.text:
         pool = sp.test[: cfg.text_n] if cfg.text_n else sp.test
         cpool = sp.check[: cfg.text_n] if cfg.text_n else sp.check
@@ -251,6 +263,15 @@ def main() -> None:
                     tcmp[f"{nm} - {tag}"] = text_compare(
                         hyps[nm], hyps[other], gold, tag=f"{nm} - {tag}")
 
+        # 생성에서의 상보성. 지난 실행이 깨진 곳이 여기라 이 수가 본 진단이다.
+        rq = {n: _rouge_each(hyps[n], gold) for n in cfg.local_names
+              if n in hyps}
+        if len(rq) == cfg.k:
+            oc_gen = complementarity(
+                rq, cfg.local_names, best["gen"],
+                arms={n: _rouge_each(hyps[n], gold) for n in ours if n in hyps})
+            oracle_report(oc_gen, "생성 (ROUGE-L, Target 응답 대비)", cfg.k)
+
     cost = cost_table(ws.model, cfg, len(sp.all))
 
     out = {
@@ -265,6 +286,8 @@ def main() -> None:
         "text_compare": {k: {m: list(v) for m, v in d.items()}
                          for k, d in tcmp.items()},
         "dependency": dep, "dependency_curve": curve,
+        "oracle_sim": oc_sim, "oracle_gen": oc_gen,
+        "shard_skew": sp.skew(cfg),
         "text": text, "victim_text": victim, "cost": cost,
         "ensemble_mean": ens_mean,
     }

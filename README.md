@@ -6,9 +6,76 @@ Neural-surrogates.
 같은 BASE 를 공유하는 여러 Local Model 을 Target 응답으로 학습시킨 뒤 하나로
 합친다. 합친 모델은 Target 보다 작고, 추론 비용은 모델 하나 분량이다.
 
+## 전제 — 조각이 IID 면 아무것도 시험되지 않는다
+
+첫 실행이 여기서 깨졌다. `shard = iid` 로 돌렸고, 그러면 조각 16 개가 **같은
+분포**에서 나온다. 같은 분포의 조각으로 학습한 모델들은 잡음으로 다르고 능력으로
+다르지 않다. 결과는 이랬다.
+
+| | |
+|---|---|
+| 기여도 점유 | `[77,3,6,4,6,27,0,31]` — 154 칸 중 77 칸이 `local_0` |
+| 생성 ROUGE-L | `local_0 0.4896` > `metamon_layer 0.4347` > `lord_all 0.4177` > `soup 0.4145` |
+
+지배하는 구성원이 있으면 **어떤 결합 규칙도 그것을 이길 수 없다.** 기전의
+실패가 아니라 전제의 부재다. "Local 1 은 문제 1 을, Local 2 는 문제 2 를
+맞춘다" 를 시험하려면 조각이 실제로 서로 다른 영역이어야 한다.
+
+그래서 조각을 비-IID 로 만든다. `Pipeline/shard.py` 가 셋을 준다.
+
+| `shard` | 무엇으로 나누나 | 갈리는 축 |
+|---|---|---|
+| `cluster` | 원문의 문자 4-gram 을 해싱해 구면 k-means. 기본값 | 어휘 / 주제 |
+| `length` | 원문 토큰 길이로 층화 | 문장 길이 |
+| `iid` | 무작위. 첫 실행이 이것이었다 | 없음 (대조군) |
+
+세 가지 모두 조각 크기를 `n_train / k` 로 **똑같이** 맞춘다. 크기가 달라지면
+`union_g` 의 데이터량이 흔들려 종속성 대조가 깨진다. `cluster` 의 군집은 크기가
+들쭉날쭉하므로 확신(1 등과 2 등 유사도의 차) 큰 것부터 용량 제한 배정을 한다.
+
+**평가 집합(`sel` / `check` / `test`)은 건드리지 않는다.** 전체 혼합 분포
+그대로다. 그래서 어느 Local 도 평가 전체를 덮지 못하고, 덮으려면 합쳐야 한다.
+이 비대칭이 병합에 이길 여지를 주는 유일한 구조다.
+
+해시는 `zlib.crc32` 다. `hash()` 는 프로세스마다 소금이 달라 같은 설정을 두 번
+돌리면 조각이 바뀌고 `shard_hash` 관문이 헛돈다.
+
+### 두 개의 진단이 관문이다
+
+**1. 조각 치우침** (`Pipeline/shard.py`, 실행 1 이 학습 **전에** 찍는다)
+
+| 값 | IID 면 | 갈렸으면 |
+|---|---|---|
+| `len_eta2` | 0 | 길이로 갈렸을 때 1 에 가깝다 |
+| `feat_cosine` | 1 에 가깝다 | 어휘로 갈렸을 때 0 에 가깝다 |
+
+두 축 어느 쪽도 갈리지 않으면 실행 1 이 **멈춘다.** 21 개를 6 시간 학습한 뒤에
+결과가 뻔한 것을 확인하는 일을 막는다. IID 대조군이 필요할 때만 `--allow-iid`
+로 뚫는다.
+
+**2. 상보성 / headroom** (`Pipeline/oracle.py`, 실행 3)
+
+```
+oracle(x) = max_k m_k(x)                         질의마다 최고 Local 을 골랐다면
+headroom  = mean(oracle) - max_k mean(m_k)
+recovery  = (mean(arm) - mean(best_local)) / headroom
+```
+
+`oracle` 은 선택 기반 결합이 넘을 수 없는 상한이다. 그래서 `headroom` 이
+전부를 결정한다.
+
+- `headroom ~ 0` → 한 Local 이 거의 모든 질의에서 이긴다. 어떤 병합도 최고
+  단일을 못 이긴다. **기전을 고칠 문제가 아니라 조각을 바꿀 문제다.**
+- `headroom >> 0` → 상보성이 있다. 이제 `recovery` 가 기전의 성적이다.
+
+`최상위 Local 승률` 도 같이 찍는다. `1/K` 면 완전 상보, `100%` 면 완전 지배다.
+첫 실행에서 이것을 재지 않은 것이 실수였다. 기전을 여섯 군데 고치기 전에 뽑을
+것이 있는지부터 확인해야 했다.
+
 ## 주장
 
-둘이다. 둘 다 미리 정한 비교로만 판정한다.
+둘이다. 둘 다 미리 정한 비교로만 판정한다. 그리고 **전제(`headroom > 0`)가
+성립하지 않으면 주장 1 은 판정이 아니라 미시험이다.** 실행 4 가 그렇게 찍는다.
 
 **1. 충실도.** 병합 모델이 최고 단일 surrogate 보다 Target 응답을 잘 재현한다.
 확률(`eq:sim`) 과 생성 문장(BLEU / ROUGE-L) 양쪽에서 본다. 확률만 높고 문장이
@@ -38,6 +105,7 @@ Neural-surrogates.
 | `Pipeline/config.py` | 하이퍼파라미터, 설정 해시 관문 | - |
 | `Pipeline/target.py` | Target Model(victim) 질의, 캐시, 질의 예산 | `theta_Target`, `y_Target` |
 | `Pipeline/data.py` | 질의 구성, Target 응답 부착, 분할, 중복 검사 | `X`, `Y_Target` |
+| `Pipeline/shard.py` | 조각 나누기(cluster / length / iid), 치우침 진단 | - |
 | `Pipeline/modeling.py` | 모델 1 인스턴스, 7 종 역할 가중치 공간 | `rho` 정의 |
 | `Pipeline/metrics.py` | 지표와 통계 | `eq:mean_log_probability`, `eq:sim`, `eq:single_fidelity`, `eq:weighted_loss`, `eq:soft_weight`, `eq:single_dependency` |
 | `Pipeline/lord.py` | LoRD 학습 | LoRD Eq.8-11 |
@@ -47,6 +115,7 @@ Neural-surrogates.
 | `Pipeline/contribution.py` | 기여도와 선택 | `eq:perturbed_loss`, `eq:partial_score`, `eq:layer_selection`, `eq:representative_update`, `eq:assembly_verification` |
 | `Pipeline/aggregate.py` | 조립 방식과 대조군 | - |
 | `Pipeline/evaluate.py` | 배율(check), 최종 비교(test) | - |
+| `Pipeline/oracle.py` | oracle, headroom, 승자 점유, 회수율 | - |
 | `Pipeline/dependency.py` | 종속성 세 집합, 앙상블 baseline | `eq:single_dependency`, `eq:dependency_mitigation` |
 | `Pipeline/textgen.py` | 생성, BLEU / ROUGE-L / BERTScore, 비용표 | - |
 
@@ -58,7 +127,8 @@ pip install -r requirements.txt
 export OPENAI_API_KEY=...
 python run/00_target.py       --out runs/gpt35 --model gpt-3.5-turbo-1106 \
                               --budget 4992
-python run/01_fleet.py        --out runs/gpt35 --fleet lord --k 16 --fleet-size 4
+python run/01_fleet.py        --out runs/gpt35 --fleet lord --k 16 \
+                              --fleet-size 4 --shard cluster
 python run/02_contribution.py --out runs/gpt35
 python run/03_evaluate.py     --out runs/gpt35 --ensemble --text
 python run/04_report.py       --out runs/gpt35
@@ -231,6 +301,7 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 순서대로 걸리며, 실패하면 그 자리에서 멈춘다.
 
 1. 설정 해시 - 기존 checkpoint 와 설정이 다르면 중단
+1.5 조각 치우침 - 두 축 어느 쪽도 갈리지 않으면 중단 (`--allow-iid` 로 뚫는다)
 2. 학습-평가 중복 - 0 이 아니면 중단
 3. arm 생존 - 배율 1.0/0.5 중 어느 것도 BASE 를 개선하지 못하면 중단
 4. 저장/복원 - 질의별 log-probability 차이가 1e-4 이상이면 중단
@@ -252,6 +323,7 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 | `weighted_t*` | `softmax(PartialScore / T)` 가중 평균. T 가 크면 soup |
 | `soup` | 균등 평균 |
 | `random_*` | 칸마다 균등 무작위 선택 |
+| oracle | 질의마다 최고 Local. 선택 기반 결합의 상한. arm 이 아니라 진단이다 |
 | `shuffle_*` | metamon 의 점유율을 유지한 채 위치만 섞음 |
 | `loo_k` | k 번째 Local 을 뺀 평균. `eq:dependency_mitigation` |
 | ensemble | 출력 확률 평균. 추론 비용 K 배 |

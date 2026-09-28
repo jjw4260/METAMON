@@ -56,6 +56,35 @@ def main() -> None:
         print(f"         metamon 시작 {g.get('start')}  "
               f"칸 {g.get('cells_taken')}/{g.get('cells_tried')} 채택")
 
+    # ------------------------------------------------ 전제
+    # 병합을 판정하기 전에 병합할 것이 있었는지부터 본다. headroom 이 0 이면
+    # 아래의 모든 비교가 "한 Local 을 이겨라" 가 되고 그건 불가능하다.
+    sk = ev.get("shard_skew") or {}
+    if sk:
+        print(f"\n[전제] 조각 치우침   len_eta2 {sk['len_eta2']:.3f}   "
+              f"feat_cosine {sk['feat_cosine']:.3f}   "
+              f"vocab_jaccard {sk['vocab_jaccard']:.3f}")
+        if sk["len_eta2"] < 0.05 and sk["feat_cosine"] > 0.90:
+            print("       *** 조각이 IID 다. 아래 주장 1 은 시험된 것이 아니다.")
+    ok_head = True
+    for key, label in (("oracle_sim", "확률"), ("oracle_gen", "생성")):
+        o = ev.get(key)
+        if not o:
+            continue
+        print(f"  [상보성 {label}]  oracle {o['oracle']:.5f}   "
+              f"최고 단일 {o['best_local_mean']:.5f}   "
+              f"headroom {o['headroom']:+.5f}   "
+              f"최상위 Local 승률 {o['dominance']*100:.1f}%")
+        print(f"     승자 점유 {o['occupancy']}")
+        if o.get("recovery"):
+            print("     회수율   " + "  ".join(
+                f"{n} {r*100:+.1f}%" for n, r in
+                sorted(o["recovery"].items(), key=lambda kv: -kv[1])))
+        if o["headroom"] <= 1e-4:
+            ok_head = False
+            print(f"     *** headroom 이 0 이다. 선택으로 얻을 것이 없다. "
+                  f"기전이 아니라 조각의 문제다.")
+
     # ------------------------------------------------ 주장 1
     print(f"\n[주장 1] 병합({arm}) 이 최고 단일 surrogate 를 이기는가")
     print(f"  최고 단일  avgBF {best.get('sim')}   손실 {best.get('loss')}   "
@@ -159,12 +188,17 @@ def main() -> None:
 
     # ------------------------------------------------ 결론
     print(f"\n[결론]")
+    print(f"  전제 (상보성)     {'있다' if ok_head else '없다'}"
+          + ("" if ok_head else "   조각이 IID 다. 주장 1 은 시험되지 않았다"))
     print(f"  주장 1 (충실도)   {'성립' if claim1 else '불성립'}"
           + ("" if claim1 else "   확률과 생성 양쪽에서 최고 단일을 이겨야 한다"))
     print(f"  주장 2 (종속성)   {'성립' if claim2 else '불성립'}"
           + ("" if claim2 else "   병합 크기에 따라 분산이 단조로 줄어야 한다"))
-    if claim1 and claim2:
+    if claim1 and claim2 and ok_head:
         print("  둘 다 성립. 시드 반복과 두 번째 subset 으로 확장할 단계.")
+    if not ok_head:
+        print("  headroom 이 없으면 주장 1 을 다시 재도 같은 결과가 나온다.")
+        print("  run/01_fleet.py --shard cluster 로 조각부터 갈라야 한다.")
     print(f"  구간은 고정된 checkpoint 의 표본 불확실성이다. "
           f"학습 시드 반복을 대신하지 않는다.")
 

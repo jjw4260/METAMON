@@ -53,7 +53,18 @@ class Config:
 
     # ---------------- fleet ----------------
     k: int = 16                    # Local Model 수
-    shard: str = "disjoint"        # "disjoint" | "bootstrap"
+    # 조각을 어떻게 나누는가. **이것이 실험의 전제다.**
+    #   iid       무작위. 조각 16 개가 같은 분포다. 상보성 0
+    #   length    원문 길이로 층화. 조각마다 길이 대역이 다르다
+    #   cluster   원문 문자 n-gram 군집. 조각마다 어휘/주제가 다르다
+    #
+    # 처음 실행을 iid 로 했고, 그래서 local_0 이 154 칸 중 77 칸을 점유하고
+    # 생성에서 모든 병합을 이겼다. 같은 분포의 조각으로 학습한 모델들은 잡음
+    # 으로 다르고 능력으로 다르지 않다. 지배하는 구성원이 있으면 어떤 결합
+    # 규칙도 그것을 못 이긴다. 기전의 실패가 아니라 전제의 부재였다.
+    # 평가 집합은 전체 혼합 그대로 두므로 어느 Local 도 평가를 덮지 못한다.
+    # 그 비대칭이 병합에 이길 여지를 주는 유일한 구조다.
+    shard: str = "cluster"         # "cluster" | "length" | "iid" | "bootstrap"
     fleet_method: str = "lord"     # "lord" | "sft"
     # 독립 fleet 대조. k 개를 fleet_size 개씩 겹치지 않게 묶는다.
     #   Dependency(single)  개별 Local. 조각 하나 분량

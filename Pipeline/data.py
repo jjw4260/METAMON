@@ -21,6 +21,7 @@ import numpy as np
 from datasets import load_dataset
 
 from .config import Config
+from .shard import make_shards, skew as shard_skew
 from .target import TASK_PROMPT
 
 Item = Dict[str, object]
@@ -117,15 +118,11 @@ class Splits:
         self.all = items
 
         per = cfg.n_train // cfg.k
-        if cfg.shard == "disjoint":
-            self.shard = {cfg.local_names[i]: list(range(i * per, (i + 1) * per))
-                          for i in range(cfg.k)}
-        else:
-            self.shard = {
-                cfg.local_names[i]: np.random.RandomState(cfg.seed + 1 + i)
-                .permutation(cfg.n_train)[: cfg.n_train // 2].tolist()
-                for i in range(cfg.k)
-            }
+        g = make_shards(cfg.shard, self.train, cfg.k, cfg.seed, log=lambda *_: None)
+        self.shard = {cfg.local_names[i]: g[i] for i in range(cfg.k)}
+
+    def skew(self, cfg: Config) -> Dict[str, float]:
+        return shard_skew(self.train, self.shard)
 
     def query_hash(self) -> str:
         h = hashlib.sha256()

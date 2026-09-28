@@ -30,6 +30,11 @@ def main() -> None:
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--fleet-size", type=int, default=2,
                     help="독립 fleet 하나에 묶을 Local 수. n_fleet = k / 이 값")
+    ap.add_argument("--shard", default=None,
+                    choices=["cluster", "length", "iid", "bootstrap"],
+                    help="조각 나누기. iid 면 상보성이 없어 병합할 것이 없다")
+    ap.add_argument("--allow-iid", action="store_true",
+                    help="조각이 IID 라는 경고를 무시하고 그대로 학습한다")
     ap.add_argument("--periods", type=int, default=None,
                     help="비우면 arm 의 질의 수에 맞춰 자동으로 잡는다")
     ap.add_argument("--lord-variant", default=None, choices=["code", "paper"],
@@ -55,6 +60,8 @@ def main() -> None:
         cfg.lord_variant = a.lord_variant
     if a.lambda1 is not None:
         cfg.lambda1 = a.lambda1
+    if a.shard is not None:
+        cfg.shard = a.shard
     cfg.makedirs()
     if cfg.n_fleet < 3:
         print(f"  *** n_fleet = {cfg.n_fleet}. 종속성 분산 추정이 얇다. "
@@ -91,6 +98,16 @@ def main() -> None:
     print(f"  GPU 여유          {gpu_free_gb():.1f}GB")
     if cfg.target_provider == "reference":
         print("  *** Target 응답이 데이터셋 정답 문장이다. 추출 충실도가 아니다.")
+
+    from Pipeline.shard import report as shard_report
+    print(f"\n[조각 진단]  shard = {cfg.shard}")
+    if not shard_report(sp.skew(cfg)) and not a.allow_iid:
+        raise SystemExit(
+            "\n조각이 사실상 IID 다. 이대로 21 개를 학습해도 한 Local 이\n"
+            "지배하고 병합은 그것을 못 이긴다(지난 실행에서 확인했다).\n"
+            "  --shard cluster   원문 어휘로 군집. 권장\n"
+            "  --shard length    원문 길이로 층화\n"
+            "  --allow-iid       그래도 돌린다 (IID 대조군을 만들 때만)")
 
     ws = WeightSpace(cfg, device)
     sel = EvalSet(sp.sel, tok, device, cfg.eval_bs)
