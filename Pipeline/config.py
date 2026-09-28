@@ -19,6 +19,12 @@ METRICS: Tuple[str, ...] = ("BLEU-1", "BLEU-4", "ROUGE-L", "BERT-F1")
 @dataclass
 class Config:
     # ---------------- 모델 / 데이터 ----------------
+    # base 가 주축이다. LoRD 는 Llama-3-8B 로 F(ROUGE-L) 0.891 을 냈고
+    # 부록에서 "2.7B 면 충분", "Phi-3(3.8B)가 Llama-3(8B)와 맞먹는다" 고 했다.
+    # 그 하한 바로 위를 잡아 "3B 병합 = 8B 단일" 을 시험한다.
+    #   TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T   1.1B  (가장 작은 점)
+    #   meta-llama/Llama-3.2-3B-Instruct                      3.2B  (본 실험)
+    #   Qwen/Qwen2.5-3B-Instruct                              3.1B  (차선)
     base: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
     dataset: str = "wmt/wmt16"
     subset: str = "cs-en"
@@ -27,7 +33,11 @@ class Config:
     # 빈 문자열이면 target.TASK_PROMPT[subset] 을 쓴다 (LoRD-MEA 와 동일)
     instruction: str = ""
     pool: int = 8192
-    max_prompt_tok: int = 96       # 프롬프트만의 상한 (질의 필터)
+    # 질의 필터는 **base 와 무관**해야 한다. surrogate 토크나이저로 거르면
+    # base 를 바꿀 때마다 질의 집합이 달라져 캐시가 안 맞고 크기 비교가 깨진다.
+    # 고정 토크나이저 하나로만 재고, 그 기준을 설정 해시에 박는다.
+    filter_tokenizer: str = "meta-llama/Llama-3.2-3B-Instruct"
+    max_prompt_tok: int = 96       # filter_tokenizer 기준 프롬프트 상한
     max_tok: int = 160             # 프롬프트 + Target 응답 상한
     seed: int = 17
 
@@ -52,7 +62,14 @@ class Config:
     n_test: int = 512
 
     # ---------------- fleet ----------------
-    k: int = 16                    # Local Model 수
+    # K 를 정하는 것은 디스크다. arm 하나가 Δw 를 통째로 갖는다.
+    #   1.1B fp16  0.97B x 2B = 1.9GB/arm    K=16 (21 arm) ->  41GB
+    #   3.2B fp16  2.82B x 2B = 5.6GB/arm    K=16 (21 arm) -> 118GB  못 담는다
+    #                                        K=8  (11 arm) ->  62GB  가능
+    k: int = 8                     # Local Model 수
+    # Δw 저장 정밀도. Δw 는 BASE 대비 1e-2 수준이라 fp16 으로 충분하다.
+    # verify_restore 가 질의별 log-probability 로 1e-4 관문을 건다.
+    delta_dtype: str = "float16"   # "float16" | "bfloat16" | "float32"
     # 조각을 어떻게 나누는가. **이것이 실험의 전제다.**
     #   iid       무작위. 조각 16 개가 같은 분포다. 상보성 0
     #   length    원문 길이로 층화. 조각마다 길이 대역이 다르다
@@ -77,8 +94,10 @@ class Config:
     # 묶음이 나왔다). 반면 7 개를 합친 loo 는 분산이 1/92 였다. 그래서 단일
     # 비교 대신 **병합 크기별 곡선**으로 본다. curve_sizes 의 각 m 에 대해
     # k 개를 m 개씩 겹치지 않게 묶어 분산을 잰다.
-    fleet_size: int = 4
-    curve_sizes: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    # E2 는 fleet_g 와 union_g 의 분산을 비교한다. n_fleet 이 2 면 분산이
+    # 표본 2개라 뜻이 없다. fleet_size=2 로 두어 묶음 4개를 만든다.
+    # E1 의 주 병합(soup / greedy)은 K 전체를 쓰므로 여기 영향을 안 받는다.
+    fleet_size: int = 2
 
     # ---------------- LoRD (LoRD-VI = 논문이 보고하는 방법) ----------------
     # lord_train.py:1109  "LoRD-VI" -> from train_pod2 import train
@@ -156,7 +175,13 @@ class Config:
     alphas: List[float] = field(default_factory=lambda: [0.25])
     scales: List[float] = field(default_factory=lambda: [
         0.0, 0.125, 0.25, 0.5, 0.75, 1.0, 1.5, 2.5, 4.0])
-    n_random: int = 8
+    n_random: int = 3               # E4 의 w/o Selection—Random
+    n_shuffle: int = 1              # 선택 자체의 값어치 대조
+    # greedy 채택 판정에 쓸 check 질의 수. 생성으로 채점하므로 비싸다.
+    greedy_n: int = 128
+    greedy_cells: int = 40          # metamon_greedy 가 시도할 상위 칸 수
+    greedy_scales: List[float] = field(
+        default_factory=lambda: [0.5, 0.75, 1.0])
     cos_max: float = 0.90          # 칸별 코사인 중앙값 관문
     beta: float = 0.1              # eq:soft_weight 의 β
 
@@ -202,23 +227,12 @@ class Config:
 
     @property
     def fleets(self) -> List[List[int]]:
-        """겹치지 않는 Local 묶음. 독립 fleet 종속성 대조에 쓴다."""
-        return self.fleets_of(self.fleet_size)
-
-    def fleets_of(self, m: int) -> List[List[int]]:
-        """k 개를 m 개씩 겹치지 않게 묶는다. 종속성 곡선의 한 점."""
-        m = max(1, min(m, self.k))
+        """겹치지 않는 Local 묶음. union_g 와 데이터량이 같은 짝을 만든다."""
+        m = max(1, min(self.fleet_size, self.k))
         return [list(range(g * m, (g + 1) * m)) for g in range(self.k // m)]
 
     @property
-    def curve(self) -> List[int]:
-        """실제로 쓸 병합 크기. k 를 나누고 묶음이 2 개 이상인 것만."""
-        return [m for m in self.curve_sizes
-                if self.k % m == 0 and self.k // m >= 2]
-
-    @property
     def union_names(self) -> List[str]:
-        """fleet g 의 조각을 합쳐 학습한 단일 모델. 데이터량 대조군."""
         return [f"union_{g}" for g in range(self.n_fleet)]
 
     @property

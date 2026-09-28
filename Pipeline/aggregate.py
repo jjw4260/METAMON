@@ -1,16 +1,26 @@
 # -*- coding: utf-8 -*-
 """조립 방식. 모두 같은 후보 집합에서 만들어야 비교가 성립한다.
 
-  metamon_layer   eq:layer_selection + eq:representative_update
-  metamon_cell    (layer, role) 마다 argmax. 집중도 대조군
-  weighted        softmax(PartialScore / T). T -> inf 면 soup, T -> 0 이면 argmax
-  soup            균등 평균
-  random          칸마다 균등 무작위 선택
-  shuffle         metamon 의 점유율을 유지한 채 위치만 섞는다
-                  (선택의 기여와 집중의 효과를 분리한다)
-  loo_k           k 번째 Local 을 뺀 평균. 겹침이 있어 참고용이다
-  fleet_g         겹치지 않는 Local 묶음 g 의 평균. 종속성 판정용
-                  같은 조각을 합쳐 학습한 union_g 와 데이터량이 같다
+설계 문서(전체 실험 구성)의 표에 실제로 들어가는 것만 남긴다. 지난 실행은
+62 개 arm 을 돌렸는데 그 중 24 개가 문서에 없는 것이었고, 정작 문서에 있는
+`loo_k` 는 빠져 있었다.
+
+  metamon_layer   eq:layer_selection + eq:representative_update   (E1 Ours)
+  metamon_cell    (layer, role) 마다 argmax                        (E4 w/o Layer-wise)
+  greedy          최고 단일에서 출발해 좋아질 때만 채택            (E1 Ours)
+  soup            균등 평균                                        (E4 w/o Selection—Uniform)
+  soup_raw        정규화 없는 균등 평균                            (E4 w/o Norm Matching)
+  random_r        칸마다 균등 무작위                               (E4 w/o Selection—Random)
+  shuffle_0       metamon 점유율 유지, 위치만 섞음                 (선택 자체의 값어치)
+  weighted_tT     softmax(PartialScore / T)                        (E5 온도 민감도)
+  loo_k           k 번째 Local 을 뺀 평균                          (E2 Leave-One-Out)
+  fleet_g         겹치지 않는 묶음 g 의 평균. union_g 와 데이터량이 같다 (E2 대조)
+
+**greedy 의 목적함수는 호출자가 준다.** 지난 실행은 채택 여부를 check 의
+avgBF 로 정했는데, 병합 arm 에서 avgBF 와 생성 ROUGE-L 의 Spearman 이
+-0.821 이었다. 확률을 올리는 방향이 생성을 내리는 방향이어서, 최고 단일에서
+출발하고도 생성에서 졌다. 보고할 지표로 채택해야 그 지표에서 최고 단일 이상이
+구성상 보장된다.
 """
 from __future__ import annotations
 
@@ -26,8 +36,10 @@ from .modeling import Key, WeightSpace
 from .weightspace import Candidates
 
 Source = Callable[[Key], torch.Tensor]
+Scorer = Callable[[], float]        # 모델이 이미 적용된 상태에서 점수 하나
 
 
+# ---------------------------------------------------------------- 기본 조립
 def soup(cand: Candidates) -> Source:
     k = len(cand.names)
     return lambda key: sum(cand.get(n, key) for n in cand.names) / k
@@ -74,27 +86,20 @@ def leave_one_out(cand: Candidates, drop: int) -> Source:
     return lambda key: sum(cand.get(n, key) for n in rest) / len(rest)
 
 
-def fleet_soup(deltas: Dict[str, Dict[Key, torch.Tensor]], names: Sequence[str],
-               device: str) -> Source:
-    """겹치지 않는 Local 묶음 하나의 균등 평균. 종속성 대조용.
-
-    정규화 없이 원본 변화량을 평균한다. 같은 데이터로 학습한 union_g 와
-    맞대어 볼 것이므로 추가 기구를 끼워 넣지 않는다.
-    """
+def mean_src(store, names: Sequence[str]) -> Source:
+    """정규화 없는 원본 Δw 의 균등 평균. 데이터량을 맞춘 대조에 쓴다."""
     n = len(names)
-    return lambda key: sum(deltas[m][key].to(device) for m in names) / n
+    return lambda key: sum(store.raw(m, key) for m in names) / n
 
 
-def single(deltas: Dict[str, Dict[Key, torch.Tensor]], name: str,
-           device: str) -> Source:
-    """개별 arm 은 정규화하지 않은 원본 변화량을 쓴다."""
-    return lambda key: deltas[name][key].to(device)
+def single(store, name: str) -> Source:
+    """개별 arm 은 정규화하지 않은 원본 Δw 를 쓴다."""
+    return lambda key: store.raw(name, key)
 
 
 def build_sources(ws: WeightSpace, cfg: Config, cand: Candidates,
-                  con: Contribution, deltas: Dict[str, Dict[Key, torch.Tensor]],
-                  win_layer: Dict[int, int], keep: set,
-                  win_cell: Dict[Key, int]) -> Dict[str, Source]:
+                  con: Contribution, store, win_layer: Dict[int, int],
+                  keep: set, win_cell: Dict[Key, int]) -> Dict[str, Source]:
     keys = ws.keys
     src: Dict[str, Source] = {
         "metamon_layer": representative(cand, con, win_layer, ws, True, keep),
@@ -105,95 +110,82 @@ def build_sources(ws: WeightSpace, cfg: Config, cand: Candidates,
     for r in range(cfg.n_random):
         src[f"random_{r}"] = random_pick(cand, keys, 100 + r)
     owners = [win_cell[k] for k in keys]
-    for r in range(cfg.n_random):
+    for r in range(cfg.n_shuffle):
         src[f"shuffle_{r}"] = shuffle_pick(cand, keys, owners, 300 + r)
     for i in range(cfg.k):
         src[f"loo_{i}"] = leave_one_out(cand, i)
-    # 독립 fleet 은 curve_sources 가 cm{m}_{g} 로 만든다.
-    # cm{fleet_size}_{g} 가 union_g 와 데이터량이 같은 짝이다.
+    # fleet_g 와 union_g 는 본 데이터가 같다. E2 의 판정이 이 짝 위에 선다.
+    for g, members in enumerate(cfg.fleets):
+        src[f"fleet_{g}"] = mean_src(
+            store, [cfg.local_names[i] for i in members])
     for name in cfg.arm_names:
-        src[name] = single(deltas, name, ws.device)
+        src[name] = single(store, name)
     return src
 
 
-# ---------------------------------------------------------------- greedy 계열
+# ---------------------------------------------------------------- greedy
 #
-# soup 은 K 개를 균등 평균하므로 나쁜 Local 이 좋은 Local 을 끌어내린다.
-# 구조적으로 최고 단일을 못 이긴다. 아래 둘은 **최고 단일에서 출발**하므로
-# check 기준으로 최고 단일 이하로 내려가지 않는다.
+# soup 은 K 개 균등 평균이라 나쁜 Local 이 좋은 Local 을 끌어내린다. 구조적으로
+# 최고 단일을 못 이긴다. greedy 는 **최고 단일에서 출발**하므로 `score` 가
+# 재는 지표에서 최고 단일 이하로 내려가지 않는다. 그래서 `score` 는 반드시
+# 보고할 지표여야 한다.
 
-def _mean_src(deltas, names, device):
-    n = len(names)
-    return lambda key: sum(deltas[m][key].to(device) for m in names) / n
-
-
-def greedy_soup(ws: WeightSpace, cfg: Config,
-                deltas: Dict[str, Dict[Key, torch.Tensor]],
-                order: Sequence[str], check, scales: Sequence[float],
-                log=print):
-    """Model Soup 의 greedy (Wortsman et al.).
-
-    check 에서 좋은 순으로 하나씩 더하고, 좋아질 때만 남긴다.
-    order 는 이미 check 기준 내림차순이어야 한다.
-    """
-    from .metrics import sim
-
+def greedy_soup(ws: WeightSpace, store, order: Sequence[str],
+                score: Scorer, scales: Sequence[float], log=print):
+    """Model Soup 의 greedy (Wortsman et al.). order 는 내림차순이어야 한다."""
     def ev(members):
-        best_v, best_s = -1.0, 0.0
-        src = _mean_src(deltas, members, ws.device)
+        best = -1e30
+        src = mean_src(store, members)
         for s in scales:
             ws.apply(src, s)
-            v = float(np.mean(sim(ws.model, check)))
-            if v > best_v:
-                best_v, best_s = v, s
+            best = max(best, score())
         ws.reset()
-        return best_v, best_s
+        return best
 
     kept = [order[0]]
-    cur, _ = ev(kept)
-    log(f"[greedy soup] 시작 {order[0]}  check {cur:.5f}")
+    cur = ev(kept)
+    log(f"[greedy soup] 시작 {order[0]}  {cur:.5f}")
     for n in order[1:]:
-        v, _ = ev(kept + [n])
+        v = ev(kept + [n])
         if v > cur:
             kept, cur = kept + [n], v
-            log(f"  + {n:10s} check {v:.5f}  채택 ({len(kept)}개)")
+            log(f"  + {n:10s} {v:.5f}  채택 ({len(kept)}개)")
         else:
-            log(f"  + {n:10s} check {v:.5f}  버림")
-    log(f"[greedy soup] 최종 {len(kept)}개 {kept}  check {cur:.5f}")
-    return _mean_src(deltas, kept, ws.device), kept
+            log(f"  + {n:10s} {v:.5f}  버림")
+    log(f"[greedy soup] 최종 {len(kept)}개 {kept}  {cur:.5f}")
+    return mean_src(store, kept), kept, cur
 
 
-def metamon_greedy(ws: WeightSpace, cfg: Config, cand: Candidates,
-                   con: Contribution, deltas: Dict[str, Dict[Key, torch.Tensor]],
-                   start: str, win_cell: Dict[Key, int], scale: float,
-                   check, log=print):
+def metamon_greedy(ws: WeightSpace, cand: Candidates, con: Contribution,
+                   store, start: str, win_cell: Dict[Key, int], scale: float,
+                   score: Scorer, max_cells: int = 40, log=print):
     """기여도 유도 greedy.
 
-    최고 단일 surrogate 에서 출발해, PartialScore 가 큰 칸부터 그 칸의
-    기여도 argmax 후보로 바꿔 보고 check 가 좋아질 때만 채택한다.
-    eq:assembly_verification 의 greedy 복구를 조립 자체에 적용한 것이다.
+    최고 단일에서 출발해 PartialScore 가 큰 칸부터 그 칸의 argmax 후보로
+    바꿔 보고 `score` 가 좋아질 때만 채택한다. 생성으로 채점하면 칸 하나마다
+    문장을 만들어야 하므로 상위 `max_cells` 칸만 본다.
     """
-    from .metrics import sim
-
     keys = list(ws.keys)
-    cur = {k: deltas[start][k].to(ws.device) for k in keys}
+    cur = {k: store.raw(start, k).clone() for k in keys}
     src = lambda k: cur[k]
     ws.apply(src, scale)
-    best = float(np.mean(sim(ws.model, check)))
-    log(f"[metamon greedy] 시작 {start} @배율 {scale}  check {best:.5f}")
+    best = score()
+    log(f"[metamon greedy] 시작 {start} @배율 {scale}  {best:.5f}")
 
     order = sorted(keys, key=lambda k: -max(con.score[k]))
     n_try = n_ok = 0
     for key in order:
+        if n_try >= max_cells:
+            break
         j = win_cell[key]
         name = cand.names[j]
         if name == start or con.score[key][j] <= 0:
             continue
         n_try += 1
         old = cur[key]
-        cur[key] = con.alpha[key][j] * cand.get(name, key)
+        cur[key] = (con.alpha[key][j] * cand.get(name, key)).clone()
         ws.apply(src, scale, subset=[key])
-        v = float(np.mean(sim(ws.model, check)))
+        v = score()
         if v > best:
             best = v
             n_ok += 1
@@ -201,16 +193,5 @@ def metamon_greedy(ws: WeightSpace, cfg: Config, cand: Candidates,
             cur[key] = old
             ws.apply(src, scale, subset=[key])
     ws.reset()
-    log(f"[metamon greedy] 칸 {n_ok}/{n_try} 채택  check {best:.5f}")
-    return (lambda k: cur[k]), n_ok, n_try
-
-
-def curve_sources(cfg: Config, deltas: Dict[str, Dict[Key, torch.Tensor]],
-                  device: str) -> Dict[str, Source]:
-    """종속성 곡선. m 개씩 겹치지 않게 묶은 균등 평균."""
-    out: Dict[str, Source] = {}
-    for m in cfg.curve:
-        for g, members in enumerate(cfg.fleets_of(m)):
-            out[f"cm{m}_{g}"] = _mean_src(
-                deltas, [cfg.local_names[i] for i in members], device)
-    return out
+    log(f"[metamon greedy] 칸 {n_ok}/{n_try} 채택 (상위 {max_cells} 중)  {best:.5f}")
+    return (lambda k: cur[k]), n_ok, n_try, best

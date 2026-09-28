@@ -74,29 +74,48 @@ recovery  = (mean(arm) - mean(best_local)) / headroom
 
 ## 주장
 
-둘이다. 둘 다 미리 정한 비교로만 판정한다. 그리고 **전제(`headroom > 0`)가
-성립하지 않으면 주장 1 은 판정이 아니라 미시험이다.** 실행 4 가 그렇게 찍는다.
+**base 가 주축이고, 병합은 base 가 덮지 못한 영역을 덮는 보정항이다.**
 
-**1. 충실도.** 병합 모델이 최고 단일 surrogate 보다 Target 응답을 잘 재현한다.
-확률(`eq:sim`) 과 생성 문장(BLEU / ROUGE-L) 양쪽에서 본다. 확률만 높고 문장이
-안 비슷하면 주장이 아니다.
+LoRD 는 Llama-3-8B 를 base 로, 질의 **16 개**로 `F(ROUGE-L) = 0.891` 을 냈다
+(base 0.348/0.604 = 0.576). 질의 수는 지렛대가 아니다. base 가 전부다.
+그리고 부록에서 스스로 선을 그어 놨다.
 
-**2. 종속성.** 병합 크기 `m` 이 커지면 surrogate 선택에 따른 분산이 단조로
-줄어든다. `cm{m}_{g}` 는 K 개 Local 을 `m` 개씩 겹치지 않게 묶어 평균한 것이고
-`m = 1` 이 단일 surrogate 다. `m in {1, 2, 4, 8}` 네 점에서 재므로 한 쌍의
-비교가 아니라 곡선이 근거가 된다. 한 쌍만 보면 좋은 Local 과 나쁜 Local 이
-1:1 로 섞여 희석이 안 되는 경우에 걸린다(`m = 2` 에서 실제로 걸렸다).
+> "a model with **2.7 billion** appears sufficient to steal domain-specific
+> knowledge from commercial LLMs"
+> "**Phi-3 (3.8B)** achieves a comparable fidelity to larger models like Llama-3 (8B)"
 
-같이 `Dependency(merged) < Dependency(union)` 도 본다.
-`union_g` 는 fleet `g` 의 조각을 **합쳐서** 학습한 단일 모델이고,
-`cm{m}_{g}` 는 같은 조각들을 따로 학습한 뒤 병합한 것이다. 둘은 본 데이터가
-같다. 그래서 분산 차이가 병합 자체의 효과가 된다. 이 대조 없이 낸 종속성 숫자는 "데이터를 더 봤을
-뿐" 으로 반박당한다. leave-one-out 분산은 K 개 중 K-1 개를 공유하므로 줄어드는
-것이 구성상 거의 자동이다. 참고로만 찍고 판정에는 쓰지 않는다.
+그 하한 바로 위를 잡아서, 검증할 등식을 하나로 줄인다.
 
-"작은 모델로 큰 모델을 뽑을 수 있다" 자체는 LoRD 가 이미 보인 것이다. 여기서
-더하는 것은 **surrogate 를 하나 고르는 일이 불안정하고, 병합이 그 불안정을
-없앤다** 는 부분이다.
+```
+F( 3B + METAMON )  >=  F( 8B + single LoRD ) = 0.891
+```
+
+**1. 충실도.** 병합이 최고 단일 surrogate 와 전체 질의 단일 모델(`lord_all`)을
+이긴다. **생성에서** 본다. LoRD Table 1 이 생성이고, 확률(`eq:sim`)과 생성의
+순위는 병합 arm 에서 Spearman −0.821 로 거의 뒤집혀 있다. 확률만 높은 것은
+주장이 아니다.
+
+**2. 기전 — 이게 본체다.** "구멍을 메운다" 는 평균이 아니라 **분포**의 주장
+이다. 질의를 BASE 의 점수로 5 등분하고 버킷마다 `병합 − 최고단일` 을 낸다.
+
+| | 뜻 |
+|---|---|
+| 이득이 **낮은 버킷에 몰린다** | base 가 못 하는 데서 병합이 산다. 성립 |
+| 이득이 고르게 퍼진다 | 보정이 아니라 그냥 평균 효과. 기각 |
+
+여기서 예측이 하나 따라 나온다. **base 가 커지면 메울 구멍이 줄어드니 이득이
+줄어야 한다.** 크기 축의 두 점에서 기울기가 같은 방향이면 기전 주장이 선다.
+
+**3. 종속성.** `Dependency(merged) < Dependency(union)`. `union_g` 는 fleet
+`g` 의 조각을 **합쳐서** 학습한 단일 모델이고 `fleet_g` 는 같은 조각들을 따로
+학습한 뒤 병합한 것이다. 둘은 본 데이터가 같으므로 분산 차이가 병합 자체의
+효과다. 이 대조 없이 낸 종속성 숫자는 "데이터를 더 봤을 뿐" 으로 반박당한다.
+leave-one-out 은 K 개 중 K−1 개를 공유하므로 참고로만 찍는다.
+
+> 병합 크기 곡선(m = 1, 2, 4, 8)은 **삭제했다.** 조각이 IID 면 `σ²/m` 이라
+> 산수지 발견이 아니고, 비-IID 로 만든 뒤에는 묶음의 m 개가 같은 분포에서
+> 뽑힌 것이 아니어서 전제마저 깨진다. 실측도 단조가 아니었다
+> (m=1 1.49e-3, m=2 2.99e-3, m=4 3.21e-3).
 
 ## 구성
 
@@ -106,6 +125,8 @@ recovery  = (mean(arm) - mean(best_local)) / headroom
 | `Pipeline/target.py` | Target Model(victim) 질의, 캐시, 질의 예산 | `theta_Target`, `y_Target` |
 | `Pipeline/data.py` | 질의 구성, Target 응답 부착, 분할, 중복 검사 | `X`, `Y_Target` |
 | `Pipeline/shard.py` | 조각 나누기(cluster / length / iid), 치우침 진단 | - |
+| `Pipeline/deltastore.py` | Δw 를 safetensors 로 두고 칸 단위로 읽기 | - |
+| `Pipeline/buckets.py` | BASE 취약도별 이득 분해 | - |
 | `Pipeline/modeling.py` | 모델 1 인스턴스, 7 종 역할 가중치 공간 | `rho` 정의 |
 | `Pipeline/metrics.py` | 지표와 통계 | `eq:mean_log_probability`, `eq:sim`, `eq:single_fidelity`, `eq:weighted_loss`, `eq:soft_weight`, `eq:single_dependency` |
 | `Pipeline/lord.py` | LoRD 학습 | LoRD Eq.8-11 |
@@ -125,13 +146,16 @@ recovery  = (mean(arm) - mean(best_local)) / headroom
 pip install -r requirements.txt
 
 export OPENAI_API_KEY=...
+export OPENAI_API_KEY=...
 python run/00_target.py       --out runs/gpt35 --model gpt-3.5-turbo-1106 \
                               --budget 4992
-python run/01_fleet.py        --out runs/gpt35 --fleet lord --k 16 \
-                              --fleet-size 4 --shard cluster
-python run/02_contribution.py --out runs/gpt35
-python run/03_evaluate.py     --out runs/gpt35 --ensemble --text
-python run/04_report.py       --out runs/gpt35
+
+# 크기 축의 한 점. --base 만 바꿔서 같은 질의로 다시 돌린다.
+python run/01_fleet.py        --out runs/l32 --fleet lord --shard cluster \
+                              --base meta-llama/Llama-3.2-3B-Instruct
+python run/02_contribution.py --out runs/l32
+python run/03_evaluate.py     --out runs/l32 --ensemble --text
+python run/04_report.py       --out runs/l32
 ```
 
 분할 크기(`n_train`, `n_sel`)는 실행 1 에서 `ckpt/config.json` 에 박힌다.
@@ -141,11 +165,28 @@ python run/04_report.py       --out runs/gpt35
 `--fleet sft` 로 바꾸면 병합 기전만 따로 볼 수 있다. 실행 2 의 결과가 남아
 있으므로 조립 방식만 바꿔 볼 때는 실행 3 부터 다시 돌리면 된다.
 
-`--k 16 --fleet-size 4` 면 학습할 모델이 Local 16 + union 4 + 전체 1 = 21 개다.
-`--k 8 --fleet-size 2` 로 줄이면 13 개로 끝나지만 종속성 곡선의 점이 `m = 1, 2`
-둘뿐이라 단조성을 말할 수 없다. 곡선은 `curve_sizes` 중 `k % m == 0` 이고
-묶음이 2 개 이상인 `m` 만 쓴다. 독립 fleet 이 3 개 미만이면 실행 1 이 경고를
-찍는다.
+기본값 `--k 8 --fleet-size 2` 면 학습할 모델이 Local 8 + union 4 + 전체 1 =
+**13 개**다. `k` 를 정하는 것은 디스크다(위의 크기 축 표). `fleet_size` 를 2 로
+둔 것은 기여 3 의 분산이 묶음 4 개 위에 서게 하기 위한 것이고, 기여 1 의 주
+병합(`soup` / `greedy`)은 K 전체를 쓰므로 영향을 안 받는다.
+
+### 크기 축
+
+`--base` 만 바꿔 같은 표를 다시 채운다. **Target 응답은 surrogate 와 무관하므로
+API 비용이 0 이다** — `target/cache.jsonl` 을 그대로 쓴다. 그게 성립하려면
+질의 필터가 base 와 무관해야 하고, `cfg.filter_tokenizer` 가 그 고정 기준이다.
+surrogate 토크나이저로 거르면 base 마다 질의 집합이 달라져 캐시도 안 맞고 크기
+비교도 깨진다.
+
+| base | 추적 파라미터 | arm 하나 (fp16) | 13 arm 합계 |
+|---|---|---|---|
+| TinyLlama-1.1B | 0.97B | 1.9GB | **25GB** |
+| Llama-3.2-3B | 2.82B | 5.6GB | **73GB** |
+| Llama-3-8B | 6.98B | 14.0GB | 182GB |
+
+**막는 것은 GPU 가 아니라 디스크다.** arm 하나가 Δw 를 통째로 갖는다. `k` 를
+정할 때 이 표를 먼저 본다. GPU 는 3B full fine-tuning 이 모델 12.8 + grad 12.8
++ Adam 25.6 = 51GB 라 80GB A100 에 들어간다.
 
 ## Target Model
 
@@ -228,7 +269,7 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 6. **period 수는 arm 의 질의 수에 맞춘다.** `periods = 0` 이면
    `ceil(len(data)/period_chunk) * lord_epochs` 로 잡는다. 고정값을 쓰면
    질의가 많은 arm(`union_g`, `<fleet>_all`)이 자기 데이터를 다 보지 못한 채
-   끝나 `cm{m}_{g}` 와의 비교가 깨진다.
+   끝나 `fleet_g` 와의 비교가 깨진다.
 
 7. **생성은 왼쪽 padding, 손실은 오른쪽 padding.** decoder-only 모델의 배치
    생성에서 오른쪽 padding 을 쓰면 짧은 프롬프트가 padding 위치에서 생성을
@@ -309,6 +350,8 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
    학습 자체가 고장난 것이므로 중단한다. union / all 은 한 번이라도 실패하면 중단
 4. 저장/복원 - 질의별 log-probability 차이가 1e-4 이상이면 중단
 5. 다양성 - 칸별 코사인 중앙값이 `cos_max` 를 넘으면 중단 (합칠 것이 없다)
+5.5 상보성 - `headroom` 이 0 이면 실행 4 가 기여 1 을 '불성립' 이 아니라
+   **'미시험'** 으로 찍는다. 뽑을 것이 없으면 기전을 고칠 문제가 아니다
 6. 통합 검증 - `eq:assembly_verification` 실패 시 greedy 복구
 
 ## 대조군
@@ -318,9 +361,10 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 | `<fleet>_all` | 전체 질의로 학습한 단일 모델. 상한선 |
 | `local_k` | 개별 Local. 조각 1 개 분량 |
 | `union_g` | fleet `g` 의 조각을 합쳐 학습한 단일 모델. **병합 없음** |
-| `cm{m}_{g}` | Local 을 `m` 개씩 겹치지 않게 묶어 평균. **병합 있음**. 종속성 곡선의 한 점이고 `m = fleet_size` 가 `union_g` 의 짝이다 |
-| `greedy_soup` | 최고 단일에서 출발해 `check` 가 좋아질 때만 하나씩 더한다 (Wortsman et al.) |
-| `metamon_greedy` | 최고 단일에서 출발해 PartialScore 큰 칸부터 갈아끼우고 `check` 가 좋아질 때만 채택 (주 결과) |
+| `fleet_g` | 묶음 `g` 의 Local 평균. **병합 있음**. `union_g` 와 데이터량이 같다 |
+| `greedy` | 최고 단일에서 출발해 좋아질 때만 채택. **주 결과**. `greedy_soup` 과 `metamon_greedy` 중 check 에서 좋은 쪽 |
+| `greedy_soup` | 하나씩 더해 본다 (Wortsman et al.) |
+| `metamon_greedy` | PartialScore 큰 칸부터 갈아끼워 본다 |
 | `metamon_layer` | `eq:layer_selection` 기반 조립 |
 | `metamon_cell` | (layer, role) 마다 argmax. 집중도 대조군 |
 | `weighted_t*` | `softmax(PartialScore / T)` 가중 평균. T 가 크면 soup |
@@ -335,38 +379,40 @@ Local  : "Instruction: {pp} User: {원문} Assistant: "
 **한 모델에 몰린 것**의 효과를 분리한다. 둘을 나누지 않으면 패배 원인을
 확정할 수 없다.
 
-`cm{fleet_size}_{g} - union_g` 는 **데이터량이 같은 짝**이다. 종속성 판정이 이
-짝과 곡선 위에 선다.
+`fleet_g - union_g` 는 **데이터량이 같은 짝**이다. 기여 3 의 판정이 이 짝
+위에 선다.
 
 `soup` 은 구성상 최고 단일을 못 이긴다. K 개 중 하나만 좋으면 나머지 K-1 개가
-끌어내린다. 실제로 생성에서 `local_0 0.4896 > soup 0.4145` 였다. 그래서 주장 1
-의 arm 은 최고 단일에서 **출발하는** `greedy_soup` / `metamon_greedy` 이고
+끌어내린다. 그래서 주 결과 arm 은 최고 단일에서 **출발하는** `greedy` 이고
 `soup` 은 `w/o Selection` ablation 행이다.
 
-## 비용 (기본 설정, A100 기준)
+**greedy 의 채택 기준은 보고할 지표와 같아야 한다.** 지난 실행은 `check` 의
+avgBF 로 채택했는데, 병합 arm 에서 avgBF 와 생성 ROUGE-L 의 Spearman 이
+−0.821 이었다. 확률을 올리는 방향이 생성을 내리는 방향이어서, 최고 단일에서
+출발하고도 생성에서 졌다. 기본값은 `--greedy-on gen` 이다. 그래야 생성에서
+최고 단일 이상이 **구성상** 보장된다.
+
+## 비용
 
 | 항목 | 수 |
 |---|---|
 | 총 질의 | 4992 (train 4096 / sel 128 / check 256 / test 512) |
-| Local 하나가 보는 조각 | 256 |
+| Local 하나가 보는 조각 | 512 |
 | `union_g` 가 보는 양 | 1024 |
-| 학습할 모델 | 21 (local 16 + union 4 + all 1) |
+| 학습할 모델 | 13 (local 8 + union 4 + all 1) |
 
-| 실행 | 시간 | 무엇에 비례하는가 |
-|---|---|---|
-| 0 Target | ~1.7h | 질의 수. API 직렬 |
-| 1 fleet | ~6.0h | `n_train` x `lord_epochs` |
-| 2 contribution | ~1.6h | **154 x K x `len(alphas)` x `n_sel`** |
-| 3 evaluate | ~2.0h | arm 수 x `len(scales)` x `n_check` |
+| 실행 | 1.1B | 3B | 무엇에 비례하는가 |
+|---|---|---|---|
+| 0 Target | ~1.7h | 0 (캐시) | 질의 수. API 직렬 |
+| 1 fleet | ~4h | ~11h | `n_train` x `lord_epochs` x 모델 크기 |
+| 2 contribution | ~0.6h | ~2h | **칸수 x K x `len(alphas)` x `n_sel`** |
+| 3 evaluate | ~1.5h | ~4h | arm 수 x `len(scales)` x `n_check` |
 
-`period_chunk` 를 `acc` 와 같게 둔 뒤 update 수가 4 배가 되었다. 방문 수는
-그대로이므로 생성 비용은 안 늘고, 버려지던 생성이 안 버려진다. 실행 1 이 늘어난
-것은 `k` 와 `n_train` 때문이다.
+실행 3 에서 `--greedy-on gen` 은 채택 판정마다 `check` 문장을 생성한다.
+`greedy_n`(128), `greedy_scales`(3점), `greedy_cells`(40)이 그 비용을 잡는
+손잡이다.
 
-실행 2 는 `n_train` 과 무관하다. 줄여야 하면 `n_sel` 과
-`alphas` 다. `n_train` 을 줄이면 조각이 얇아져 Local 이 안 붙는다.
-
-`alphas` 를 1 점으로 둔 것은 논문 축이 종속성으로 바뀌었기 때문이다.
-주 결과인 `greedy_soup` 과 종속성 곡선은 실행 2 를 쓰지 않는다. `metamon_greedy`
-는 칸 순서에만 PartialScore 를 쓰므로 격자 1 점으로 충분하다. 기여도 기반
-선택 자체를 본 결과로 쓸 때는 `--alphas 0.125 0.25 0.5` 로 되돌린다.
+`alphas` 를 1 점으로 둔 것은 기여도 기반 선택이 주 결과가 아니라 ablation 이기
+때문이다. 주 결과인 `greedy` 는 칸 **순서**에만 PartialScore 를 쓰므로 격자
+1 점으로 충분하다. 선택 자체를 본 결과로 쓸 때는 `--alphas 0.125 0.25 0.5` 로
+되돌린다.

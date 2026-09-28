@@ -57,7 +57,8 @@ import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
 from .config import Config
-from .modeling import WeightSpace, ckpt_path, save_atomic
+from .deltastore import save_delta
+from .modeling import WeightSpace
 
 
 # ---------------------------------------------------------------- 기본 연산
@@ -335,4 +336,4 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
         del opt
         torch.cuda.empty_cache()
 
-    save_atomic(ws.snapshot(), ckpt_path(cfg, name))
+    save_delta(ws, cfg, name)        # Δw 를 safetensors 로. 절대 가중치가 아니다

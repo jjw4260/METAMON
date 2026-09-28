@@ -3,16 +3,16 @@
 
     python run/04_report.py --out runs/gpt35
 
-주장이 둘이다. 둘 다 미리 정한 비교로만 판정한다.
+축이 base 다. base 가 주축이고 병합은 **base 가 덮지 못한 영역을 덮는** 보정항
+이다. 그래서 판정도 그 순서로 한다.
 
-  주장 1 (충실도)  병합 - 최고 단일 surrogate > 0
-      **확률과 생성 양쪽에서** 봐야 하고, 최고 단일을 고르는 기준도 보고하는
-      지표와 같아야 한다. avgBF 로 고르면 생성에서 5 위인 Local 이 뽑힌다.
-      확률에서 이기고 생성에서 지면 성립이 아니다. LoRD Table 1 이 생성이다.
-
-  주장 2 (종속성)  병합 크기가 커지면 종속성이 준다
-      cm{m}_{g} 는 겹치지 않는 묶음이다. m 이 커지며 분산이 단조로 줄어야 한다.
-      union_g 대조로 "데이터를 더 봐서 준 것" 을 배제한다.
+  전제   조각이 갈렸는가(shard_skew), 뽑을 것이 있는가(headroom)
+         headroom 이 0 이면 주장 1 은 불성립이 아니라 **미시험**이다
+  기여 1 병합이 최고 단일과 lord_all 을 **생성에서** 이기는가
+  기전   이득이 BASE 가 약한 질의에 몰리는가 (버킷)
+         이게 "병합이 base 의 구멍을 메운다" 의 본 증거다. 고르게 퍼져 있으면
+         보정이 아니라 그냥 평균 효과다
+  기여 2 fleet_g 와 union_g 는 본 데이터가 같다. 그 짝의 분산 차이
 """
 from __future__ import annotations
 
@@ -28,6 +28,29 @@ from Pipeline.config import METRICS, load as load_cfg
 
 def _mark(lo, hi):
     return "양수" if lo > 0 else ("음수" if hi < 0 else "불확실")
+
+
+def _bucket(bk, label):
+    if not bk or not bk.get("rows"):
+        return None
+    rows, ref = bk["rows"], bk["ref"]
+    names = list(rows[0]["gain"])
+    print(f"\n  [{label}] 질의를 BASE 점수로 5 등분. 기준선 = {ref}")
+    print(f"    {'버킷':>4s} {'n':>4s} {'BASE':>8s} "
+          + "".join(f"{n[:13]:>14s}" for n in names))
+    for r in rows:
+        print(f"    {r['bucket']:4d} {r['n']:4d} {r['base_mean']:8.4f} "
+              + "".join(f"{r['gain'][n][0]:+14.4f}" for n in names))
+    print(f"    {'낮은버킷 - 높은버킷':>18s} "
+          + "".join(f"{bk['slope'][n]['bucket_first_minus_last']:+14.4f}"
+                    for n in names))
+    print(f"    {'상관(BASE, 이득)':>18s} "
+          + "".join(f"{bk['slope'][n]['corr_query']:+14.4f}" for n in names))
+    ok = {n: (bk["slope"][n]["bucket_first_minus_last"] > 0
+              and bk["slope"][n]["corr_query"] < 0) for n in names}
+    hit = [n for n, v in ok.items() if v]
+    print(f"    -> 구멍을 메우는 arm: {hit or '없음'}")
+    return bool(hit)
 
 
 def main() -> None:
@@ -46,26 +69,28 @@ def main() -> None:
     best = ev.get("best_local") or {}
     arm = a.arm or ev.get("arm") or "soup"
 
+    print(f"[base] {cfg.base}")
+    print(f"       K={cfg.k}  fleet_size={cfg.fleet_size}  shard={cfg.shard}  "
+          f"질의 {cfg.n_train + cfg.n_sel + cfg.n_check + cfg.n_test}")
     if cfg.target_provider == "reference":
-        print("*** Target 이 reference 다. 추출 충실도가 아니다. 보고하지 말 것.\n")
+        print("*** Target 이 reference 다. 추출 충실도가 아니다. 보고하지 말 것.")
 
     g = ev.get("greedy") or {}
     if g:
-        print(f"[greedy] soup 구성 {len(g.get('soup_members', []))}개 "
-              f"{g.get('soup_members')}")
-        print(f"         metamon 시작 {g.get('start')}  "
-              f"칸 {g.get('cells_taken')}/{g.get('cells_tried')} 채택")
+        print(f"[greedy] 기준 {g.get('on')}  시작 {g.get('start')}  "
+              f"채택 {g.get('picked')}")
+        print(f"         soup {len(g.get('soup_members', []))}개 "
+              f"check {g.get('soup_check', float('nan')):.5f}  |  "
+              f"metamon 칸 {g.get('cells_taken')}/{g.get('cells_tried')} "
+              f"check {g.get('metamon_check', float('nan')):.5f}")
 
     # ------------------------------------------------ 전제
-    # 병합을 판정하기 전에 병합할 것이 있었는지부터 본다. headroom 이 0 이면
-    # 아래의 모든 비교가 "한 Local 을 이겨라" 가 되고 그건 불가능하다.
     sk = ev.get("shard_skew") or {}
     if sk:
         print(f"\n[전제] 조각 치우침   len_eta2 {sk['len_eta2']:.3f}   "
-              f"feat_cosine {sk['feat_cosine']:.3f}   "
-              f"vocab_jaccard {sk['vocab_jaccard']:.3f}")
+              f"feat_cosine {sk['feat_cosine']:.3f}")
         if sk["len_eta2"] < 0.05 and sk["feat_cosine"] > 0.90:
-            print("       *** 조각이 IID 다. 아래 주장 1 은 시험된 것이 아니다.")
+            print("       *** 조각이 IID 다. 아래 기여 1 은 시험된 것이 아니다.")
     ok_head = True
     for key, label in (("oracle_sim", "확률"), ("oracle_gen", "생성")):
         o = ev.get(key)
@@ -74,19 +99,17 @@ def main() -> None:
         print(f"  [상보성 {label}]  oracle {o['oracle']:.5f}   "
               f"최고 단일 {o['best_local_mean']:.5f}   "
               f"headroom {o['headroom']:+.5f}   "
-              f"최상위 Local 승률 {o['dominance']*100:.1f}%")
-        print(f"     승자 점유 {o['occupancy']}")
+              f"최상위 승률 {o['dominance']*100:.1f}% "
+              f"(완전 상보 {100.0/cfg.k:.1f}%)")
         if o.get("recovery"):
             print("     회수율   " + "  ".join(
                 f"{n} {r*100:+.1f}%" for n, r in
                 sorted(o["recovery"].items(), key=lambda kv: -kv[1])))
         if o["headroom"] <= 1e-4:
             ok_head = False
-            print(f"     *** headroom 이 0 이다. 선택으로 얻을 것이 없다. "
-                  f"기전이 아니라 조각의 문제다.")
 
-    # ------------------------------------------------ 주장 1
-    print(f"\n[주장 1] 병합({arm}) 이 최고 단일 surrogate 를 이기는가")
+    # ------------------------------------------------ 기여 1
+    print(f"\n[기여 1] 병합({arm})이 최고 단일과 {cfg.all_name} 을 이기는가")
     print(f"  최고 단일  avgBF {best.get('sim')}   손실 {best.get('loss')}   "
           f"생성 {best.get('gen')}")
 
@@ -100,7 +123,7 @@ def main() -> None:
             ok_sim[tag] = lo > 0
             print(f"    {k:38s} {d:+.5f}  [{lo:+.5f}, {hi:+.5f}]  {_mark(lo, hi)}")
 
-    print(f"\n  생성 (Target 응답 대비, paired bootstrap)")
+    print(f"\n  생성 (Target 응답 대비, paired bootstrap)   <- 본 판정")
     ok_gen = {}
     if tcmp:
         for tag in ("best_local(gen)", "best_local(loss)", cfg.all_name):
@@ -112,10 +135,15 @@ def main() -> None:
                     print(f"    {k:30s} {m:8s} {d:+.5f}  "
                           f"[{lo:+.5f}, {hi:+.5f}]  {_mark(lo, hi)}")
     else:
-        print("    생성 비교 없음. run/03_evaluate.py --text 로 다시 돌릴 것.")
+        print("    생성 비교 없음. --text 로 다시 돌릴 것.")
+    claim1 = bool(ok_gen.get("best_local(gen)")) and \
+        bool(ok_gen.get(cfg.all_name))
 
-    claim1 = bool(ok_sim.get("best_local(loss)")) and \
-        bool(ok_gen.get("best_local(gen)"))
+    # ------------------------------------------------ 기전 (버킷)
+    print(f"\n[기전] 이득이 BASE 가 약한 질의에 몰리는가")
+    h1 = _bucket(ev.get("bucket_sim"), "확률")
+    h2 = _bucket(ev.get("bucket_gen"), "생성")
+    mech = bool(h2 if h2 is not None else h1)
 
     # ------------------------------------------------ 표
     text = ev.get("text") or {}
@@ -123,8 +151,8 @@ def main() -> None:
     if text and any("vs_ref" in (v or {}) for v in text.values()):
         head = [m for m in METRICS
                 if any(m in (v.get("vs_ref") or {}) for v in text.values())]
-        label = {"__base__": "Basic theta (Local Model)",
-                 "soup": "Uniform Merge", cfg.all_name: "All-query LoRD"}
+        label = {"__base__": "Basic theta (BASE)", "soup": "Uniform Merge",
+                 cfg.all_name: "All-query LoRD", "greedy": "METAMON"}
         order = ([n for n in text if n.startswith("local_")]
                  + [n for n in text if not n.startswith("local_")
                     and n != "__base__"])
@@ -146,35 +174,24 @@ def main() -> None:
                 print(f"    {label.get(nm, nm):30s}"
                       + "".join(f"{v.get(m, float('nan')):>10.4f}" for m in head)
                       + (f"{f:>12.3f}" if key == "vs_ref" else ""))
-        for nm in (arm, best.get("gen")):
-            for s in (text.get(nm, {}).get("sample") or [])[:1]:
-                print(f"    [{nm} 예시]")
-                print(f"      Target    {s['target'][:86]}")
-                print(f"      surrogate {s['surrogate'][:86]}")
+        print(f"\n    LoRD 논문 (Llama-3-8B, 질의 16): "
+              f"BLEU-4 0.249  ROUGE-L 0.538  BERT 0.906  F(ROUGE-L) 0.891")
+        print(f"    LoRD 논문 BASE                : "
+              f"BLEU-4 0.105  ROUGE-L 0.348  BERT 0.868  F(ROUGE-L) 0.576")
 
-    # ------------------------------------------------ 주장 2
-    print(f"\n[주장 2] 병합 크기가 커지면 surrogate 선택 의존이 주는가")
-    cv = ev.get("dependency_curve") or {}
-    rows = cv.get("rows") or []
-    claim2 = False
-    if rows:
-        print(f"    {'m':>3s} {'묶음':>4s} {'분산':>11s} {'평균':>9s}")
-        for r in rows:
-            print(f"    {r['m']:3d} {r['n']:4d} {r['var']:11.3e} {r['mean']:9.5f}")
-        f0, fl = rows[0], rows[-1]
-        print(f"    m={f0['m']} -> m={fl['m']}  "
-              f"{f0['var'] / max(fl['var'], 1e-30):.1f}배 감소   "
-              f"{'단조 감소' if cv.get('monotone') else '단조가 아니다'}")
-        claim2 = bool(cv.get("monotone")) and fl["var"] < f0["var"]
+    # ------------------------------------------------ 기여 2
+    print(f"\n[기여 2] 데이터량을 맞춘 짝에서 병합이 종속성을 줄이는가")
     dep = ev.get("dependency") or {}
-    if dep.get("union") and dep.get("merged"):
-        print(f"    데이터량 대조  union {dep['union']:.3e}  "
-              f"merged {dep['merged']:.3e}  "
-              f"{'merged 가 작다' if dep['merged'] < dep['union'] else '불성립'}")
+    claim2 = bool(dep.get("ok"))
+    if dep:
+        print(f"    single {dep['single']:.3e}   union {dep['union']:.3e}   "
+              f"merged {dep['merged']:.3e}   "
+              f"{'merged < union 성립' if claim2 else '불성립'}")
         pos = sum(1 for k, v in cmp_.items()
-                  if k.startswith(f"cm{cfg.fleet_size}_") and "union" in k
-                  and v[1] > 0)
+                  if k.startswith("fleet_") and "union" in k and v[1] > 0)
         print(f"    같은 데이터에서 병합이 이긴 묶음 {pos}/{cfg.n_fleet}")
+        if cfg.n_fleet < 3:
+            print(f"    *** 묶음이 {cfg.n_fleet}개다. 분산 추정이 얇다.")
 
     # ------------------------------------------------ 비용
     c = ev.get("cost") or {}
@@ -187,18 +204,16 @@ def main() -> None:
               f"{arm}(1배) {tm.get(arm, float('nan')):.5f}")
 
     # ------------------------------------------------ 결론
-    print(f"\n[결론]")
+    print(f"\n[결론]  base = {cfg.base}")
     print(f"  전제 (상보성)     {'있다' if ok_head else '없다'}"
-          + ("" if ok_head else "   조각이 IID 다. 주장 1 은 시험되지 않았다"))
-    print(f"  주장 1 (충실도)   {'성립' if claim1 else '불성립'}"
-          + ("" if claim1 else "   확률과 생성 양쪽에서 최고 단일을 이겨야 한다"))
-    print(f"  주장 2 (종속성)   {'성립' if claim2 else '불성립'}"
-          + ("" if claim2 else "   병합 크기에 따라 분산이 단조로 줄어야 한다"))
-    if claim1 and claim2 and ok_head:
-        print("  둘 다 성립. 시드 반복과 두 번째 subset 으로 확장할 단계.")
-    if not ok_head:
-        print("  headroom 이 없으면 주장 1 을 다시 재도 같은 결과가 나온다.")
-        print("  run/01_fleet.py --shard cluster 로 조각부터 갈라야 한다.")
+          + ("" if ok_head else "   조각이 IID 다. 기여 1 은 미시험"))
+    print(f"  기여 1 (충실도)   {'성립' if claim1 else '불성립'}"
+          + ("" if claim1 else "   생성에서 최고 단일과 all 을 이겨야 한다"))
+    print(f"  기전  (구멍 메움) {'성립' if mech else '불성립'}"
+          + ("" if mech else "   이득이 낮은 버킷에 몰려야 한다"))
+    print(f"  기여 2 (종속성)   {'성립' if claim2 else '불성립'}")
+    if claim1 and mech:
+        print("  -> 다음 크기 점으로 넘어갈 단계. 같은 표를 base 를 바꿔 채운다.")
     print(f"  구간은 고정된 checkpoint 의 표본 불확실성이다. "
           f"학습 시드 반복을 대신하지 않는다.")
 

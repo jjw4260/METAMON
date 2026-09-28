@@ -19,7 +19,8 @@ from .config import Config
 from .data import Splits
 from .lord import train_lord
 from .metrics import EvalSet, loss, token_avg_logp
-from .modeling import Key, WeightSpace, ckpt_path
+from .deltastore import DeltaStore, st_path
+from .modeling import Key, WeightSpace
 from .sft import train_sft
 
 
@@ -39,7 +40,7 @@ def build_fleet(ws: WeightSpace, tok, cfg: Config, sp: Splits,
         return loss(ws.model, sel)
 
     for name in cfg.arm_names:
-        if os.path.exists(ckpt_path(cfg, name)):
+        if os.path.exists(st_path(cfg, name)):
             log(f"  {name} 건너뜀")
             continue
         idx, seed = _assignment(cfg, sp, name)
@@ -96,17 +97,18 @@ def _gate(ws: WeightSpace, cfg: Config, sel: EvalSet, name: str,
     설계의 결과다. `own` 이 없으면(union / all / IID local) 전체 혼합이 기준이며
     거기서 못 오르면 학습이 고장난 것이므로 그 자리에서 멈춘다.
     """
-    state = torch.load(ckpt_path(cfg, name), map_location="cpu")
-    delta = {k: state[k].float() - ws.base[k].cpu() for k in ws.keys}
+    st = DeltaStore(ws, cfg, [name], log=lambda *_: None)
+    src = lambda k: st.raw(name, k)
     best, best_own = None, None
     for s in (1.0, 0.5):
-        ws.apply(lambda k: delta[k], s)
+        ws.apply(src, s)
         v = loss(ws.model, sel)
         best = v if best is None else min(best, v)
         if own is not None:
             w = loss(ws.model, own)
             best_own = w if best_own is None else min(best_own, w)
     ws.reset()
+    st.close()
 
     if own is not None:
         ok = best_own < base_own
@@ -128,43 +130,41 @@ def _gate(ws: WeightSpace, cfg: Config, sel: EvalSet, name: str,
     return True
 
 
-def load_deltas(ws: WeightSpace, cfg: Config, log=print
-                ) -> Dict[str, Dict[Key, torch.Tensor]]:
-    """저장 가중치 - BASE. CPU 에 둔다(메모리)."""
-    out: Dict[str, Dict[Key, torch.Tensor]] = {}
-    base_cpu = {k: v.cpu() for k, v in ws.base.items()}
-    frob = math.sqrt(sum(float((v ** 2).sum()) for v in base_cpu.values()))
+def open_store(ws: WeightSpace, cfg: Config, log=print) -> DeltaStore:
+    """Δw 저장소를 연다. 디스크에 두고 칸 단위로 읽는다.
+
+    예전 `load_deltas` 는 arm 전부를 CPU 에 올렸다. 3B 21 arm 이면 237GB 라
+    Colab 에서 시작도 못 한다. 여기서는 열기만 하고 상주 메모리는 칸 하나 분이다.
+    """
+    store = DeltaStore(ws, cfg, cfg.arm_names, log=log)
     log(f"[적재] {'arm':12s} {'유한':>5s} {'상대Δ':>11s}")
     for name in cfg.arm_names:
-        st = torch.load(ckpt_path(cfg, name), map_location="cpu")
-        if set(st.keys()) != set(ws.keys):
-            raise SystemExit(f"{name}: key 불일치")
-        if not all(torch.isfinite(v).all().item() for v in st.values()):
+        if not store.finite(name):
             raise SystemExit(f"{name}: NaN/Inf 가 저장돼 있다")
-        dw = {k: st[k].float() - base_cpu[k] for k in ws.keys}
-        rel = math.sqrt(sum(float((v ** 2).sum()) for v in dw.values())) / frob
-        log(f"  {name:12s} {'True':>5s} {rel:11.3e}")
-        out[name] = dw
-        del st
-    return out
+        log(f"  {name:12s} {'True':>5s} {store.rel_delta(name):11.3e}")
+    store.release()
+    return store
 
 
-def verify_restore(ws: WeightSpace, cfg: Config,
-                   deltas: Dict[str, Dict[Key, torch.Tensor]],
+def verify_restore(ws: WeightSpace, cfg: Config, store: DeltaStore,
                    sel: EvalSet, log=print) -> None:
-    """저장 가중치 직접 적재 vs BASE + Δw 가 같은 결과를 내는지 확인한다."""
+    """BASE + Δw 를 적용한 것과, 저장된 Δw 를 그대로 쓴 것이 같은지 본다.
+
+    Δw 를 fp16 으로 저장하므로 여기서 걸리는 것이 그 손실이다. 질의별
+    log-probability 차이가 1e-4 를 넘으면 delta_dtype 을 float32 로 올린다.
+    """
     ok_all = True
-    for name, dw in deltas.items():
-        st = torch.load(ckpt_path(cfg, name), map_location="cpu")
-        ws.load_state(st)
+    for name in cfg.arm_names:
+        ws.load_state({k: store.state(name, k) for k in ws.keys})
         a = token_avg_logp(ws.model, sel)
-        ws.apply(lambda k: dw[k].to(ws.device), 1.0)
+        ws.apply(lambda k: store.raw(name, k), 1.0)
         b = token_avg_logp(ws.model, sel)
         ws.reset()
         qm = float(np.max(np.abs(a - b)))
         ok = qm < 1e-4
         ok_all &= ok
         log(f"  {name:10s} 질의별 최대 차이 {qm:.3e}  {'통과' if ok else '실패'}")
-        del st
+    store.release()
     if not ok_all:
-        raise SystemExit("복원 불일치. 성능 판정을 진행하지 않는다.")
+        raise SystemExit(
+            "복원 불일치. cfg.delta_dtype 을 'float32' 로 올리고 다시 저장할 것.")

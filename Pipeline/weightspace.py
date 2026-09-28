@@ -11,14 +11,12 @@
 
   측정에 쓴 후보를 그대로 조립에 쓴다. 고른 뒤 크기를 바꾸지 않는다.
 
-후보는 **CPU 에 둔다.** K 개를 전부 GPU 에 올리면 K x 조립대상 만큼 든다.
-TinyLlama-1.1B 는 조립 대상이 969M 이라 fp32 로 후보 하나가 3.9GB,
-K=8 이면 31GB 다. 모델(4.4) 과 BASE 사본(3.9) 까지 더하면 A100 40GB 도
-한계에 붙고 16GB 는 그 자리에서 터진다.
+후보는 **디스크에 둔다**(`DeltaStore`). K 개를 전부 GPU 에 올리면
+K x 조립대상 만큼 들고, CPU 에 올려도 3B 에서 21 arm 이 237GB 라 못 올린다.
 
 접근은 전부 **칸 단위**다(`apply` 도 `measure` 도 key 하나씩 돈다). 그래서
-현재 칸의 K 개만 GPU 에 올려 두는 캐시 하나면 충분하다. 가장 큰 칸이
-down_proj 5632x2048 = 46MB 이므로 K=8 에서 370MB 다.
+현재 칸의 K 개만 GPU 에 올려 두는 캐시 하나면 충분하다. 그 캐시는 DeltaStore
+가 갖고 있고, Candidates 는 거기에 eq:norm_matching 계수만 얹는다.
 """
 from __future__ import annotations
 
@@ -35,25 +33,18 @@ from .modeling import Key
 class Candidates:
     """위치별 norm 을 맞춘 후보 집합. CPU 에 두고 칸 단위로 GPU 에 올린다."""
 
-    def __init__(self, deltas: Dict[str, Dict[Key, torch.Tensor]],
-                 names: Sequence[str], keys: Sequence[Key], device: str,
-                 log=print):
+    def __init__(self, store, names: Sequence[str], keys: Sequence[Key],
+                 device: str, log=print):
         self.names = list(names)
         self.keys = list(keys)
         self.device = device
-        # 원본 Δw 를 참조만 한다. 제자리로 고치면 local_k / union_g / fleet_g
-        # arm 이 정규화된 Δ 를 쓰게 되고, 사본을 만들면 CPU 에 K 벌이 더 든다.
-        # 정규화 계수만 갖고 있다가 전송 뒤 GPU 에서 곱한다.
-        self.src = deltas
-        self.norm = {n: {k: float(deltas[n][k].norm()) for k in keys}
-                     for n in names}
+        # Δw 자체는 store 가 디스크에서 칸 단위로 준다. 여기서는 정규화 계수만
+        # 갖는다. 제자리로 고치면 local_k / union_g arm 이 정규화된 Δ 를 쓰게
+        # 되므로 곱은 언제나 전송 뒤 GPU 에서 한다.
+        self.src = store
+        self.norm = {n: {k: store.norm[n][k] for k in keys} for n in names}
         self.median = {k: float(np.median([self.norm[n][k] for n in names]))
                        for k in keys}
-        self._ck: Optional[Key] = None          # 현재 GPU 에 올라온 칸
-        self._buf: Dict[str, torch.Tensor] = {}
-        big = max(deltas[names[0]][k].numel() for k in keys) * 4
-        log(f"[후보] K={len(self.names)}  CPU 상주  "
-            f"칸 캐시 최대 {big*len(self.names)/1e6:.0f}MB")
 
     def factor(self, name: str, key: Key) -> float:
         """eq:norm_matching (수정판). 위치별 median norm 으로 맞추는 계수."""
@@ -63,27 +54,17 @@ class Candidates:
     #      이름별로 게으르게 채운다. soup 처럼 K 개를 다 쓰면 K 개가 올라오고,
     #      representative 처럼 하나만 쓰면 하나만 올라온다.
     def raw(self, name: str, key: Key) -> torch.Tensor:
-        """정규화 이전 Δw. GPU 사본을 캐시한다."""
-        if self._ck != key:
-            self._ck, self._buf = key, {}
-        t = self._buf.get(name)
-        if t is None:
-            t = self.src[name][key].to(self.device, non_blocking=True)
-            self._buf[name] = t
-        return t
+        """정규화 이전 Δw (GPU). 캐시는 store 가 칸 단위로 들고 있다."""
+        return self.src.raw(name, key)
 
     def get(self, name: str, key: Key) -> torch.Tensor:
         return self.raw(name, key) * self.factor(name, key)
-
-    def __getitem__(self, name: str) -> Dict[Key, torch.Tensor]:
-        return self.src[name]
 
     def by_index(self, i: int, key: Key) -> torch.Tensor:
         return self.get(self.names[i], key)
 
     def release(self) -> None:
-        self._ck, self._buf = None, {}
-        torch.cuda.empty_cache()
+        self.src.release()
 
     # ------------------------------------------------ 다양성 관문
     def pairwise_cosine(self) -> List[Tuple[str, str, float, float, float]]:

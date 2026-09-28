@@ -15,7 +15,8 @@ from torch.nn.utils import clip_grad_norm_
 
 from .config import Config
 from .lord import token_logp
-from .modeling import WeightSpace, ckpt_path, save_atomic
+from .deltastore import save_delta
+from .modeling import WeightSpace
 
 
 def train_sft(ws: WeightSpace, tok, cfg: Config, name: str,
@@ -62,4 +63,4 @@ def train_sft(ws: WeightSpace, tok, cfg: Config, name: str,
         del opt
         torch.cuda.empty_cache()
 
-    save_atomic(ws.snapshot(), ckpt_path(cfg, name))
+    save_delta(ws, cfg, name)

@@ -35,8 +35,29 @@ def local_prompt(cfg: Config, src: str) -> str:
     return f"Instruction: {instruction(cfg)} User: {src} Assistant: "
 
 
-def build_queries(cfg: Config, tok) -> List[Item]:
-    """Target 에 보낼 질의 목록. 아직 응답은 없다."""
+def filter_tokenizer(cfg: Config):
+    """질의를 거르는 **고정** 토크나이저. base 와 무관하다.
+
+    surrogate 토크나이저로 거르면 base 를 바꿀 때마다 질의 집합이 달라진다.
+    그러면 Target 응답 캐시가 안 맞아 돈을 다시 내야 하고, 1.1B 와 3B 가 서로
+    다른 test 집합을 보게 되어 크기 비교가 성립하지 않는다.
+    """
+    from transformers import AutoTokenizer
+    name = cfg.filter_tokenizer or cfg.base
+    try:
+        return AutoTokenizer.from_pretrained(name)
+    except Exception as e:                       # 게이트된 저장소 등
+        raise SystemExit(
+            f"질의 필터 토크나이저를 못 읽었다: {name}\n  {e}\n"
+            f"  cfg.filter_tokenizer 를 공개 모델로 바꾸거나 HF_TOKEN 을 설정할 것.\n"
+            f"  **base 로 대체하면 안 된다.** 크기 비교가 깨진다.")
+
+
+def build_queries(cfg: Config, tok=None) -> List[Item]:
+    """Target 에 보낼 질의 목록. 아직 응답은 없다.
+
+    `tok` 인자는 받지만 쓰지 않는다. 필터는 언제나 cfg.filter_tokenizer 다.
+    """
     ds = load_dataset(cfg.dataset, cfg.subset, split="train")
     n = min(cfg.pool, len(ds))
     rows = [ds[i]["translation"] for i in range(n)]
@@ -44,7 +65,8 @@ def build_queries(cfg: Config, tok) -> List[Item]:
     srcs = [r[cfg.src_key] for r in rows]
     refs = [r[cfg.tgt_key] for r in rows]
     prompts = [local_prompt(cfg, s) for s in srcs]
-    enc = tok(prompts, add_special_tokens=True)["input_ids"]
+    ftok = filter_tokenizer(cfg)
+    enc = ftok(prompts, add_special_tokens=True)["input_ids"]
 
     seen, items = set(), []
     for s, r, p, ip in zip(srcs, refs, prompts, enc):
@@ -68,6 +90,10 @@ def attach(items: Sequence[Item], responses: Sequence[str], cfg: Config, tok,
     for it, resp in zip(items, responses):
         g = " " + resp.strip()
         gid = tok(g, add_special_tokens=False)["input_ids"]
+        # pid 는 **surrogate** 토크나이저로 다시 잡는다. build_queries 가 넣어
+        # 둔 것은 base 무의지 필터용이라 학습 길이와 다르다.
+        it = dict(it)
+        it["pid"] = tok(it["prompt"], add_special_tokens=True)["input_ids"]
         room = cfg.max_tok - len(it["pid"])
         if room < 1:
             raise SystemExit("max_tok 이 프롬프트보다 짧다. 설정을 확인할 것.")

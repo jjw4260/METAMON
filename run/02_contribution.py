@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from Pipeline.config import Config, assert_same_data, load as load_cfg
 from Pipeline.contribution import measure, verify_assembly
 from Pipeline.data import Splits, load_dataset_file
-from Pipeline.fleet import load_deltas, verify_restore
+from Pipeline.fleet import open_store, verify_restore
 from Pipeline.metrics import EvalSet, loss, sim, soft_weight
 from Pipeline.modeling import WeightSpace, gpu_free_gb, load_tokenizer, setup_precision
 from Pipeline.weightspace import Candidates
@@ -52,10 +52,10 @@ def main() -> None:
     print(f"[시작] GPU 여유 {gpu_free_gb():.1f}GB   base L(theta;1) "
           f"{loss(ws.model, sel):.5f}")
 
-    deltas = load_deltas(ws, cfg)
-    verify_restore(ws, cfg, deltas, sel)
+    store = open_store(ws, cfg)
+    verify_restore(ws, cfg, store, sel)
 
-    cand = Candidates(deltas, cfg.local_names, ws.keys, device)
+    cand = Candidates(store, cfg.local_names, ws.keys, device)
     worst_cos = cand.diversity_gate(cfg.cos_max)
     torch.cuda.empty_cache()
 
@@ -64,7 +64,7 @@ def main() -> None:
     if a.omega == "soft":
         sims = []
         for n in cfg.local_names:
-            ws.apply(lambda k, d=deltas[n]: d[k].to(device), 1.0)
+            ws.apply(lambda k, nm=n: store.raw(nm, k), 1.0)
             sims.append(sim(ws.model, sel))
             ws.reset()
         omegas = soft_weight(np.stack(sims), cfg.beta)      # (K, N)

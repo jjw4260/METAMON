@@ -5,22 +5,19 @@
 
 실행 2 의 결과만 읽는다. 재측정 없음.
 
-주장이 둘이므로 재는 것도 둘이다.
+논문의 축이 base 로 바뀌었다. base 가 주축이고 병합은 **base 가 덮지 못한
+영역을 덮는** 보정항이다. 그래서 재는 것이 셋이다.
 
-  주장 1 (충실도)  병합 - 최고 단일 surrogate > 0
-      확률(eq:sim) 과 생성(BLEU/ROUGE-L) 양쪽에서 본다. 그리고 **최고 단일을
-      고르는 기준도 보고하는 지표와 같아야 한다.** avgBF 로 고르면 생성에서
-      5 위인 Local 이 뽑히는 것을 확인했다. 그래서 세 가지로 다 고른다.
-          best_sim   check 의 avgBF
-          best_loss  check 의 L(theta;1)      <- 기여도와 같은 기준
-          best_gen   check 의 생성 ROUGE-L    <- 생성으로 보고할 때의 기준
-      soup 은 K 개 균등 평균이라 구조적으로 최고 단일을 못 이긴다.
-      greedy 계열이 그 자리를 맡는다(최고 단일에서 출발한다).
+  E1  추출 성능      병합이 최고 단일 surrogate 를, 그리고 전체 질의 단일
+                     모델(lord_all)을 이기는가. **생성**에서 본다
+  E2  종속성         fleet_g 와 union_g 는 본 데이터가 같다. 그 짝의 분산 차이
+  버킷 분해          질의를 BASE 점수로 나눠 이득이 **낮은 버킷에 몰리는가**.
+                     이것이 "병합이 base 의 구멍을 메운다" 의 본 증거다
 
-  주장 2 (종속성)  병합 크기가 커지면 종속성이 준다
-      cm{m}_{g} 는 Local 을 m 개씩 겹치지 않게 묶은 평균이다. 겹치지 않으므로
-      leave-one-out 처럼 "공유해서 분산이 준" 것이 아니다.
-      union_g 는 같은 조각을 합쳐 학습한 단일 모델이다(데이터량 대조).
+**greedy 의 채택 기준은 보고할 지표와 같아야 한다.** 지난 실행은 check 의
+avgBF 로 채택했는데, 병합 arm 에서 avgBF 와 생성 ROUGE-L 의 Spearman 이
+-0.821 이었다. 확률을 올리는 방향이 생성을 내리는 방향이어서 최고 단일에서
+출발하고도 생성에서 졌다. `--greedy-on gen` 이 기본이다.
 """
 from __future__ import annotations
 
@@ -35,20 +32,21 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Pipeline.aggregate import (build_sources, curve_sources, greedy_soup,
-                                metamon_greedy, weight_spread, weighted)
+from Pipeline.aggregate import (build_sources, greedy_soup, metamon_greedy,
+                                weight_spread, weighted)
+from Pipeline.buckets import by_base_weakness, report as bucket_report
 from Pipeline.config import assert_same_data, load as load_cfg
 from Pipeline.contribution import Contribution
 from Pipeline.data import Splits, load_dataset_file
-from Pipeline.dependency import (dependency_curve, output_ensemble,
-                                 recovery_ratio, surrogate_dependency)
+from Pipeline.dependency import (output_ensemble, recovery_ratio,
+                                 surrogate_dependency)
 from Pipeline.evaluate import ArmResult, compare, mean_of, run_all
-from Pipeline.fleet import load_deltas
+from Pipeline.fleet import open_store
 from Pipeline.metrics import EvalSet, loss, paired_bootstrap, sim, verdict
 from Pipeline.modeling import WeightSpace, load_tokenizer, setup_precision
 from Pipeline.oracle import complementarity, report as oracle_report
-from Pipeline.textgen import (cost_table, generate, score_text,
-                              text_compare, victim_scores)
+from Pipeline.textgen import (cost_table, generate, score_text, text_compare,
+                              victim_scores, _rouge_each)
 from Pipeline.weightspace import Candidates
 
 
@@ -59,23 +57,19 @@ def _keys(d):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--ckpt", default=None)
-    ap.add_argument("--taus", type=float, nargs="*",
-                    default=[0.1, 0.3, 1.0, 3.0, 10.0])
+    ap.add_argument("--taus", type=float, nargs="*", default=[0.3, 1.0, 3.0])
+    ap.add_argument("--arm", default="greedy",
+                    help="주 결과로 보고할 arm")
+    ap.add_argument("--greedy-on", default="gen", choices=["gen", "sim"],
+                    help="greedy 채택 기준. gen=check 생성 ROUGE-L (기본)")
+    ap.add_argument("--no-greedy", action="store_true")
     ap.add_argument("--ensemble", action="store_true")
     ap.add_argument("--text", action="store_true")
-    ap.add_argument("--no-greedy", action="store_true")
-    ap.add_argument("--scales", type=float, nargs="*", default=None)
-    ap.add_argument("--arm", default="metamon_greedy",
-                    help="04 가 'Ours' 로 볼 arm")
     a = ap.parse_args()
 
-    cfg_path = os.path.join(a.ckpt or a.out, "ckpt", "config.json")
+    cfg_path = os.path.join(a.out, "ckpt", "config.json")
     cfg = load_cfg(cfg_path)
     cfg.out_root = a.out
-    cfg.ckpt_root = a.ckpt or ""
-    if a.scales:
-        cfg.scales = sorted(set([0.0] + list(a.scales)))
     device = setup_precision()
     tok = load_tokenizer(cfg)
     sp = Splits(cfg, load_dataset_file(cfg.dataset_path, cfg, tok))
@@ -95,30 +89,26 @@ def main() -> None:
     win_layer = {int(k): v for k, v in raw["winner_layer"].items()}
     keep = set(raw["kept_layers"])
 
-    deltas = load_deltas(ws, cfg)
-    cand = Candidates(deltas, cfg.local_names, ws.keys, device)
-    torch.cuda.empty_cache()
+    store = open_store(ws, cfg)
+    cand = Candidates(store, cfg.local_names, ws.keys, device)
 
-    src = build_sources(ws, cfg, cand, con, deltas, win_layer, keep, win_cell)
-    src.update(curve_sources(cfg, deltas, device))
+    src = build_sources(ws, cfg, cand, con, store, win_layer, keep, win_cell)
     spread = weight_spread(con, ws.keys)
     for t in a.taus:
         src[f"weighted_t{t}"] = weighted(cand, con, ws.keys, t * spread)
 
     # ---------------------------------------------------------------- 1 단계
     names = ([cfg.all_name] + cfg.local_names + cfg.union_names
+             + [f"fleet_{g}" for g in range(cfg.n_fleet)]
              + ["metamon_layer", "metamon_cell", "soup", "soup_raw"]
              + [f"random_{i}" for i in range(cfg.n_random)]
-             + [f"shuffle_{i}" for i in range(cfg.n_random)]
-             + [f"cm{m}_{g}" for m in cfg.curve for g in range(cfg.k // m)
-                if m > 1]
+             + [f"shuffle_{i}" for i in range(cfg.n_shuffle)]
+             + [f"loo_{i}" for i in range(cfg.k)]
              + [f"weighted_t{t}" for t in a.taus])
+    print(f"[arm] {len(names)}개 평가한다")
     res = run_all(ws, cfg, src, names, check, test)
-    for i, n in enumerate(cfg.local_names):          # m=1 은 개별 Local 이다
-        res[f"cm1_{i}"] = res[n]
-        src[f"cm1_{i}"] = src[n]
 
-    # ---- 최고 단일을 세 기준으로 고른다. 기준이 다르면 다른 Local 이 뽑힌다.
+    # ---- 최고 단일. 기준마다 다른 Local 이 뽑히므로 셋 다 고른다.
     print("\n[최고 단일 선택]  check 에서 고른다. test 를 보고 고르면 oracle 이다.")
     ck_loss = {}
     for n in cfg.local_names:
@@ -130,43 +120,79 @@ def main() -> None:
     print(f"  avgBF 기준   {best['sim']}   check {res[best['sim']].check:.5f}")
     print(f"  손실 기준    {best['loss']}   check L {ck_loss[best['loss']]:.5f}")
 
-    # ---- 상보성. 뽑을 것이 있는지부터 본다. headroom 이 0 이면 그 뒤가 무의미하다.
     oc_sim = complementarity({n: res[n].test for n in cfg.local_names},
                              cfg.local_names, best["loss"])
     oracle_report(oc_sim, "확률 (eq:sim)", cfg.k)
 
+    # ---------------------------------------------------------------- 생성 준비
+    # greedy 를 생성으로 채점하려면 check 생성이 먼저 있어야 한다.
+    cpool = sp.check[: cfg.greedy_n] if cfg.greedy_n else sp.check
+    cgold = [x["gold"].strip() for x in cpool]
+
+    def gen(nm_or_src, items, scale=1.0):
+        s = src[nm_or_src] if isinstance(nm_or_src, str) else nm_or_src
+        if nm_or_src == "__base__":
+            ws.reset()
+        else:
+            ws.apply(s, scale)
+        h = generate(ws.model, tok, items, cfg, device)
+        ws.reset()
+        torch.cuda.empty_cache()
+        return h
+
+    ck_gen = {}
+    if a.text or a.greedy_on == "gen":
+        print(f"\n[생성] check {len(cpool)} 질의로 최고 단일을 고른다")
+        for n in cfg.local_names:
+            ck_gen[n] = float(np.mean(_rouge_each(
+                gen(n, cpool, res[n].scale), cgold)))
+            print(f"    {n:10s} check ROUGE-L {ck_gen[n]:.4f}")
+        best["gen"] = max(cfg.local_names, key=lambda n: ck_gen[n])
+        print(f"  생성 기준    {best['gen']}   check ROUGE-L "
+              f"{ck_gen[best['gen']]:.4f}")
+
     # ---------------------------------------------------------------- 2 단계
-    # greedy 계열은 1 단계 결과(순서, 시작점)가 있어야 만들 수 있다.
     greedy_info = {}
     if not a.no_greedy:
-        print()
-        order = sorted(cfg.local_names, key=lambda n: -res[n].check)
-        gs, kept_names = greedy_soup(
-            ws, cfg, deltas, order, check, [0.5, 0.75, 1.0, 1.5])
-        src["greedy_soup"] = gs
-        start = best["loss"]
-        mg, n_ok, n_try = metamon_greedy(
-            ws, cfg, cand, con, deltas, start, win_cell,
-            res[start].scale, check)
-        src["metamon_greedy"] = mg
-        greedy_info = {"soup_members": kept_names, "start": start,
-                       "cells_taken": n_ok, "cells_tried": n_try}
-        res.update(run_all(ws, cfg, src, ["greedy_soup", "metamon_greedy"],
+        if a.greedy_on == "gen":
+            start = best["gen"]
+            order = sorted(cfg.local_names, key=lambda n: -ck_gen[n])
+            def score():
+                h = generate(ws.model, tok, cpool, cfg, device)
+                return float(np.mean(_rouge_each(h, cgold)))
+        else:
+            start = best["loss"]
+            order = sorted(cfg.local_names, key=lambda n: -res[n].check)
+            def score():
+                return float(np.mean(sim(ws.model, check)))
+        print(f"\n[greedy]  채택 기준 = {a.greedy_on}   시작 {start}")
+        gs, kept, v_gs = greedy_soup(ws, store, order, score, cfg.greedy_scales)
+        mg, n_ok, n_try, v_mg = metamon_greedy(
+            ws, cand, con, store, start, win_cell, res[start].scale, score,
+            max_cells=cfg.greedy_cells)
+        # 둘 중 check 에서 좋은 쪽을 본 결과 arm 으로 삼는다. 둘 다 최고 단일
+        # 에서 출발했으므로 어느 쪽이든 그 기준에서 최고 단일 이상이다.
+        src["greedy"] = gs if v_gs >= v_mg else mg
+        src["greedy_soup"], src["metamon_greedy"] = gs, mg
+        greedy_info = {"on": a.greedy_on, "start": start, "soup_members": kept,
+                       "soup_check": v_gs, "metamon_check": v_mg,
+                       "cells_taken": n_ok, "cells_tried": n_try,
+                       "picked": "greedy_soup" if v_gs >= v_mg else "metamon_greedy"}
+        print(f"  -> {greedy_info['picked']} 채택 "
+              f"(soup {v_gs:.5f} vs metamon {v_mg:.5f})")
+        res.update(run_all(ws, cfg, src,
+                           ["greedy", "greedy_soup", "metamon_greedy"],
                            check, test))
 
-    rand = mean_of(res, "random_", cfg.n_random)
-    shuf = mean_of(res, "shuffle_", cfg.n_random)
-    res["random_mean"] = ArmResult(0.0, 0.0, rand, [])
-    res["shuffle_mean"] = ArmResult(0.0, 0.0, shuf, [])
+    res["random_mean"] = ArmResult(0.0, 0.0, mean_of(res, "random_", cfg.n_random), [])
     res["local_mean"] = ArmResult(0.0, 0.0, mean_of(res, "local_", cfg.k), [])
     best_tau = max(a.taus, key=lambda t: res[f"weighted_t{t}"].check)
     res["weighted"] = res[f"weighted_t{best_tau}"]
 
     arm = a.arm if a.arm in res else "soup"
-    ours = [n for n in ("greedy_soup", "metamon_greedy", "soup",
-                        "metamon_layer", "weighted") if n in res]
+    ours = [n for n in ("greedy", "soup", "metamon_layer", "weighted")
+            if n in res]
 
-    # 회수율까지 포함해 다시 낸다. headroom 의 몇 %를 기전이 가져왔는가.
     oc_sim = complementarity({n: res[n].test for n in cfg.local_names},
                              cfg.local_names, best["loss"],
                              arms={n: res[n].test for n in ours})
@@ -185,17 +211,16 @@ def main() -> None:
             if nm != other:
                 pairs.append((f"{nm} - {tag}", nm, other))
     pairs += [
-        ("metamon_layer - shuffle 평균 (위치 선택)", "metamon_layer", "shuffle_mean"),
-        ("shuffle 평균 - random 평균 (집중 효과)", "shuffle_mean", "random_mean"),
+        ("metamon_layer - shuffle_0 (위치 선택)", "metamon_layer", "shuffle_0"),
+        ("shuffle_0 - random 평균 (집중 효과)", "shuffle_0", "random_mean"),
     ]
     for g in range(cfg.n_fleet):                    # 데이터량을 맞춘 짝
-        nm = f"cm{cfg.fleet_size}_{g}"
-        if nm in res and f"union_{g}" in res:
-            pairs.append((f"{nm} - union_{g} (데이터 동일)", nm, f"union_{g}"))
+        if f"fleet_{g}" in res and f"union_{g}" in res:
+            pairs.append((f"fleet_{g} - union_{g} (데이터 동일)",
+                          f"fleet_{g}", f"union_{g}"))
     table = compare(res, pairs, cfg.boot)
 
     dep = surrogate_dependency(res, cfg)
-    curve = dependency_curve(res, cfg)
 
     ens_mean = None
     if a.ensemble:
@@ -206,33 +231,32 @@ def main() -> None:
         recovery_ratio(ens, res[arm].test, res[best["loss"]].test)
         ens_mean = float(np.mean(ens))
 
-    # ---------------------------------------------------------------- 텍스트
-    text, victim, tcmp, oc_gen = {}, None, {}, None
-    text_state = {"text": {}, "victim": None, "tcmp": {}, "oc_gen": None,
-                  "best": best, "hyps_path":
-                  os.path.join(cfg.log_dir, "03_hyps.json"),
-                  "query_hash": sp.query_hash()}
-
     cost = cost_table(ws.model, cfg, len(sp.all))
     skew = sp.skew(cfg)
+    text, victim, tcmp, oc_gen, bk_sim, bk_gen = {}, None, {}, None, None, None
+
+    # ---- BASE 의 질의별 확률. 버킷을 가르는 기준이다.
+    ws.reset()
+    base_q = list(map(float, sim(ws.model, test)))
+    bk_sim = by_base_weakness(base_q, {n: res[n].test for n in ours + [best["loss"]]},
+                              best["loss"])
+    bucket_report(bk_sim, "확률 (eq:sim)")
 
     def save() -> str:
-        """지금까지 나온 것을 전부 저장한다. 텍스트 단계에서 죽어도 확률
-        결과는 남는다. 생성은 비싸므로 hyps 를 따로 캐시한다."""
         out = {
             "arm": arm, "best_local": best, "best_tau": best_tau,
-            "check_loss": ck_loss, "greedy": greedy_info,
+            "check_loss": ck_loss, "check_gen": ck_gen, "greedy": greedy_info,
             "scale": {n: r.scale for n, r in res.items() if r.curve},
             "check": {n: r.check for n, r in res.items() if r.curve},
             "test_mean": {n: r.test_mean for n, r in res.items()},
             "test_per_query": {n: list(map(float, r.test)) for n, r in res.items()},
+            "base_per_query": base_q,
             "curves": {n: r.curve for n, r in res.items() if r.curve},
             "compare": {k: list(v) for k, v in table.items()},
             "text_compare": {k: {m: list(v) for m, v in d.items()}
                              for k, d in tcmp.items()},
-            "dependency": dep, "dependency_curve": curve,
-            "oracle_sim": oc_sim, "oracle_gen": oc_gen,
-            "shard_skew": skew,
+            "dependency": dep, "oracle_sim": oc_sim, "oracle_gen": oc_gen,
+            "bucket_sim": bk_sim, "bucket_gen": bk_gen, "shard_skew": skew,
             "text": text, "victim_text": victim, "cost": cost,
             "ensemble_mean": ens_mean,
         }
@@ -241,94 +265,61 @@ def main() -> None:
                   ensure_ascii=False)
         return p
 
-    # 텍스트 단계 전에 한 번 저장한다. 생성에서 무슨 일이 나도 확률 결과와
-    # 종속성 곡선은 이미 디스크에 있다.
     print(f"\n중간 저장: {save()}")
 
     # ---------------------------------------------------------------- 텍스트
     if a.text:
+        st = {"text": {}, "victim": None, "tcmp": {}, "oc_gen": None,
+              "bk_gen": None, "best": best,
+              "hyps_path": os.path.join(cfg.log_dir, "03_hyps.json"),
+              "query_hash": sp.query_hash()}
         try:
-            _text_stage(ws, tok, cfg, sp, src, res, best, ours, arm, device,
-                        best_tau, text_state)
+            _text_stage(ws, tok, cfg, sp, src, res, best, ours, device, base_q,
+                        best_tau, gen, st)
         except Exception:
             import traceback
             print("\n*** 텍스트 단계가 실패했다. 확률 결과는 이미 저장돼 있다.")
             traceback.print_exc()
-        text = text_state["text"]
-        victim = text_state["victim"]
-        tcmp = text_state["tcmp"]
-        oc_gen = text_state["oc_gen"]
-        best = text_state["best"]
+        text, victim, tcmp = st["text"], st["victim"], st["tcmp"]
+        oc_gen, bk_gen, best = st["oc_gen"], st["bk_gen"], st["best"]
 
-    path = save()
-    print(f"\n저장: {path}")
+    print(f"\n저장: {save()}")
 
 
-def _text_stage(ws, tok, cfg, sp, src, res, best, ours, arm, device,
-                best_tau, st) -> None:
-    """생성과 텍스트 지표. 생성 결과는 디스크에 캐시한다.
-
-    생성이 이 단계 비용의 대부분이다. 뒤에서 무엇이 터지든 다시 생성하지
-    않도록 hyps 를 먼저 저장하고, 다시 돌릴 때 같은 질의면 그대로 읽는다.
-    """
-    from Pipeline.textgen import _rouge_each
+def _text_stage(ws, tok, cfg, sp, src, res, best, ours, device, base_q,
+                best_tau, gen, st) -> None:
+    """생성과 텍스트 지표. 생성 결과는 arm 마다 디스크에 캐시한다."""
     pool = sp.test[: cfg.text_n] if cfg.text_n else sp.test
-    cpool = sp.check[: cfg.text_n] if cfg.text_n else sp.check
     gold = [x["gold"].strip() for x in pool]
     ref = [str(x["ref"]).strip() for x in pool]
-    cgold = [x["gold"].strip() for x in cpool]
-
-    def gen(nm, items):
-        if nm == "__base__":
-            ws.reset()
-        else:
-            ws.apply(src[nm], res[nm].scale if nm in res else 1.0)
-        h = generate(ws.model, tok, items, cfg, device)
-        ws.reset()
-        torch.cuda.empty_cache()
-        return h
 
     arms = (["__base__"] + cfg.local_names + ours
             + [cfg.all_name, "metamon_cell", "soup_raw",
                f"weighted_t{best_tau}"])
     arms = [n for i, n in enumerate(arms) if n not in arms[:i]]
 
-    # ---- 캐시. 같은 질의에 대해 이미 생성해 둔 것이 있으면 다시 안 만든다.
     cache = {}
     if os.path.exists(st["hyps_path"]):
         try:
             c = json.load(open(st["hyps_path"], encoding="utf-8"))
             if c.get("query_hash") == st["query_hash"]:
                 cache = c
-                print(f"\n[생성 캐시] {st['hyps_path']} 사용. "
-                      f"arm {len(c.get('hyps', {}))}개, check {len(c.get('ck_gen', {}))}개")
+                print(f"\n[생성 캐시] arm {len(c.get('hyps', {}))}개 재사용")
         except Exception:
             cache = {}
-
-    ck_gen = cache.get("ck_gen") or {}
-    if len(ck_gen) < cfg.k:
-        print(f"\n[생성] check {len(cpool)} 질의로 최고 단일을 고른다")
-        for n in cfg.local_names:
-            if n not in ck_gen:
-                ck_gen[n] = float(np.mean(_rouge_each(gen(n, cpool), cgold)))
-    best["gen"] = max(cfg.local_names, key=lambda n: ck_gen[n])
-    for n in cfg.local_names:
-        print(f"    {n:10s} check ROUGE-L {ck_gen[n]:.4f}"
-              + ("   <- 최고" if n == best["gen"] else ""))
 
     print(f"\n[텍스트] test {len(pool)} 질의 생성 "
           f"({'greedy' if cfg.text_temp <= 0 else f'T={cfg.text_temp}'})   "
           f"BERTScore {cfg.bert_score_model or '끔'}")
     hyps = dict(cache.get("hyps") or {})
-    todo = [n for n in arms if n not in hyps and (n == "__base__" or n in src)]
-    for nm in todo:
-        hyps[nm] = gen(nm, pool)
-        # 한 arm 끝날 때마다 저장한다. 중간에 끊겨도 거기까지는 산다.
-        json.dump({"query_hash": st["query_hash"], "hyps": hyps,
-                   "ck_gen": ck_gen},
+    for nm in arms:
+        if nm in hyps or (nm != "__base__" and nm not in src):
+            continue
+        hyps[nm] = gen(nm, pool, res[nm].scale if nm in res else 1.0)
+        json.dump({"query_hash": st["query_hash"], "hyps": hyps},
                   open(st["hyps_path"], "w", encoding="utf-8"),
                   ensure_ascii=False)
-    print(f"  생성 완료 {len(hyps)}개 arm   캐시 {st['hyps_path']}")
+    print(f"  생성 완료 {len(hyps)}개 arm")
 
     victim = victim_scores(gold, ref, cfg)
     st["victim"] = victim
@@ -338,18 +329,23 @@ def _text_stage(ws, tok, cfg, sp, src, res, best, ours, arm, device,
             continue
         text[nm] = score_text(hyps[nm], gold, ref, cfg, victim=victim, tag=nm)
         text[nm]["sample"] = [
-            {"prompt": pool[i]["prompt"], "target": gold[i],
-             "ref": ref[i], "surrogate": hyps[nm][i]}
-            for i in range(min(3, len(pool)))]
+            {"prompt": pool[i]["prompt"], "target": gold[i], "ref": ref[i],
+             "surrogate": hyps[nm][i]} for i in range(min(3, len(pool)))]
     st["text"] = text
 
-    # ---- 생성에서의 상보성. 이 수가 본 진단이므로 비교보다 먼저 낸다.
+    # ---- 생성에서의 상보성과 버킷. 이것이 본 진단이므로 비교보다 먼저 낸다.
     rq = {n: _rouge_each(hyps[n], gold) for n in cfg.local_names if n in hyps}
+    arm_q = {n: _rouge_each(hyps[n], gold) for n in ours if n in hyps}
     if len(rq) == cfg.k:
-        st["oc_gen"] = complementarity(
-            rq, cfg.local_names, best["gen"],
-            arms={n: _rouge_each(hyps[n], gold) for n in ours if n in hyps})
+        st["oc_gen"] = complementarity(rq, cfg.local_names, best["gen"],
+                                       arms=arm_q)
         oracle_report(st["oc_gen"], "생성 (ROUGE-L, Target 응답 대비)", cfg.k)
+    if "__base__" in hyps and best["gen"] in hyps:
+        b = _rouge_each(hyps["__base__"], gold)
+        d = dict(arm_q)
+        d[best["gen"]] = _rouge_each(hyps[best["gen"]], gold)
+        st["bk_gen"] = by_base_weakness(b, d, best["gen"])
+        bucket_report(st["bk_gen"], "생성 (ROUGE-L)")
 
     print(f"\n[생성 비교] paired bootstrap 95%  (Target 응답 대비)")
     tcmp = {}
@@ -362,7 +358,6 @@ def _text_stage(ws, tok, cfg, sp, src, res, best, ours, arm, device,
                     hyps[nm], hyps[other], gold, tag=f"{nm} - {tag}")
     st["tcmp"] = tcmp
     st["best"] = best
-
 
 
 if __name__ == "__main__":

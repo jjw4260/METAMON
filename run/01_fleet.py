@@ -27,8 +27,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="runs/default")
     ap.add_argument("--fleet", default="lord", choices=["lord", "sft"])
-    ap.add_argument("--k", type=int, default=8)
-    ap.add_argument("--fleet-size", type=int, default=2,
+    ap.add_argument("--base", default=None,
+                    help="surrogate base. 크기 축의 한 점. 예: "
+                         "meta-llama/Llama-3.2-3B-Instruct")
+    ap.add_argument("--k", type=int, default=None)
+    ap.add_argument("--fleet-size", type=int, default=None,
                     help="독립 fleet 하나에 묶을 Local 수. n_fleet = k / 이 값")
     ap.add_argument("--shard", default=None,
                     choices=["cluster", "length", "iid", "bootstrap"],
@@ -48,8 +51,13 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
 
-    cfg = Config(out_root=a.out, fleet_method=a.fleet, k=a.k, seed=a.seed,
-                 fleet_size=a.fleet_size)
+    cfg = Config(out_root=a.out, fleet_method=a.fleet, seed=a.seed)
+    if a.base is not None:
+        cfg.base = a.base
+    if a.k is not None:
+        cfg.k = a.k
+    if a.fleet_size is not None:
+        cfg.fleet_size = a.fleet_size
     if a.n_train is not None:
         cfg.n_train = a.n_train
     if a.n_sel is not None:
@@ -64,8 +72,8 @@ def main() -> None:
         cfg.shard = a.shard
     cfg.makedirs()
     if cfg.n_fleet < 3:
-        print(f"  *** n_fleet = {cfg.n_fleet}. 종속성 분산 추정이 얇다. "
-              f"k 를 늘리거나 fleet_size 를 줄일 것.")
+        print(f"  *** n_fleet = {cfg.n_fleet}. E2 의 분산이 표본 "
+              f"{cfg.n_fleet}개다. fleet_size 를 줄일 것.")
 
     # Target 설정은 실행 0 이 남긴 것을 그대로 따른다. 설정 해시에 포함된다.
     tmeta_path = os.path.join(cfg.log_dir, "00_target.json")

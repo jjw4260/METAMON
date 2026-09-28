@@ -103,7 +103,7 @@ def make_shards(mode: str, train: Sequence[dict], k: int, seed: int,
         g = {j: np.random.RandomState(seed + 1 + j).permutation(n)[:per].tolist()
              for j in range(k)}
     elif mode == "length":
-        key = np.array([len(x["pid"]) for x in train], dtype=np.int64)
+        key = np.array([len(str(x["src"])) for x in train], dtype=np.int64)
         order = np.argsort(key, kind="stable")[:use]
         g = {j: sorted(order[j * per:(j + 1) * per].tolist()) for j in range(k)}
     elif mode == "cluster":
@@ -133,7 +133,8 @@ def skew(train: Sequence[dict], shard: Dict[str, List[int]]) -> Dict[str, float]
     IID 다. 그 상태에서 병합이 최고 단일을 이기는 일은 없다.
     """
     names = list(shard)
-    ln = np.array([len(x["pid"]) for x in train], dtype=np.float64)
+    # 길이는 **문자 수**로 잰다. 토큰 수로 재면 base 마다 조각이 달라진다.
+    ln = np.array([len(str(x["src"])) for x in train], dtype=np.float64)
     parts = [ln[shard[nm]] for nm in names]
     gm = ln.mean()
     sst = float(((ln - gm) ** 2).sum())
