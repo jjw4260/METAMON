@@ -126,14 +126,22 @@ def main() -> None:
 
     # ---------------------------------------------------------------- 생성 준비
     # greedy 를 생성으로 채점하려면 check 생성이 먼저 있어야 한다.
-    cpool = sp.check[: cfg.greedy_n] if cfg.greedy_n else sp.check
+    # check 생성을 **둘로 쪼갠다.** 앞쪽으로 greedy 를 만들고 뒤쪽으로 고른다.
+    # 한 집합에서 만들고 그 집합에서 고르면 과적합한다. 지난 실행에서
+    # metamon_greedy 의 check 생성이 0.5577 -> 0.6582 로 뛰었는데 test 확률은
+    # soup 보다 0.047 낮았다. 128 문장에 맞춘 것이다.
+    cfull = sp.check[: cfg.greedy_n * 2] if cfg.greedy_n else sp.check
+    half = len(cfull) // 2
+    cpool, vpool = cfull[:half], cfull[half:]
     cgold = [x["gold"].strip() for x in cpool]
+    vgold = [x["gold"].strip() for x in vpool]
 
     def gen(nm_or_src, items, scale=1.0):
-        s = src[nm_or_src] if isinstance(nm_or_src, str) else nm_or_src
+        # src 를 먼저 꺼내면 "__base__" 에서 KeyError 가 난다. 분기 안에서 꺼낸다.
         if nm_or_src == "__base__":
             ws.reset()
         else:
+            s = src[nm_or_src] if isinstance(nm_or_src, str) else nm_or_src
             ws.apply(s, scale)
         h = generate(ws.model, tok, items, cfg, device)
         ws.reset()
@@ -172,14 +180,31 @@ def main() -> None:
             max_cells=cfg.greedy_cells)
         # 둘 중 check 에서 좋은 쪽을 본 결과 arm 으로 삼는다. 둘 다 최고 단일
         # 에서 출발했으므로 어느 쪽이든 그 기준에서 최고 단일 이상이다.
-        src["greedy"] = gs if v_gs >= v_mg else mg
         src["greedy_soup"], src["metamon_greedy"] = gs, mg
+
+        # ---- 남겨 둔 절반에서 고른다. soup 도 후보에 넣는다. greedy 가
+        #      만들어진 집합에서만 좋고 다른 집합에서 안 좋으면 soup 이 이긴다.
+        def verify(nm):
+            if a.greedy_on == "gen":
+                h = gen(src[nm], vpool, res[nm].scale if nm in res else
+                        res[start].scale)
+                return float(np.mean(_rouge_each(h, vgold)))
+            ws.apply(src[nm], res[start].scale)
+            v = float(np.mean(sim(ws.model, check)))
+            ws.reset()
+            return v
+
+        cands = {"greedy_soup": gs, "metamon_greedy": mg, "soup": src["soup"]}
+        vs = {nm: verify(nm) for nm in cands}
+        pick = max(vs, key=lambda n: vs[n])
+        src["greedy"] = cands[pick]
+        print(f"  [검증] 남겨 둔 {len(vpool)} 질의   "
+              + "  ".join(f"{n} {v:.5f}" for n, v in vs.items()))
         greedy_info = {"on": a.greedy_on, "start": start, "soup_members": kept,
-                       "soup_check": v_gs, "metamon_check": v_mg,
-                       "cells_taken": n_ok, "cells_tried": n_try,
-                       "picked": "greedy_soup" if v_gs >= v_mg else "metamon_greedy"}
-        print(f"  -> {greedy_info['picked']} 채택 "
-              f"(soup {v_gs:.5f} vs metamon {v_mg:.5f})")
+                       "build_check": {"greedy_soup": v_gs, "metamon_greedy": v_mg},
+                       "verify_check": vs, "cells_taken": n_ok,
+                       "cells_tried": n_try, "picked": pick}
+        print(f"  -> {pick} 채택")
         res.update(run_all(ws, cfg, src,
                            ["greedy", "greedy_soup", "metamon_greedy"],
                            check, test))

@@ -180,18 +180,30 @@ def main() -> None:
               f"BLEU-4 0.105  ROUGE-L 0.348  BERT 0.868  F(ROUGE-L) 0.576")
 
     # ------------------------------------------------ 기여 2
-    print(f"\n[기여 2] 데이터량을 맞춘 짝에서 병합이 종속성을 줄이는가")
+    print(f"\n[기여 2] 데이터량을 맞춘 짝: fleet_g 대 union_g")
     dep = ev.get("dependency") or {}
-    claim2 = bool(dep.get("ok"))
+    pos = sum(1 for k, v in cmp_.items()
+              if k.startswith("fleet_") and "union" in k and v[1] > 0)
+    neg = sum(1 for k, v in cmp_.items()
+              if k.startswith("fleet_") and "union" in k and v[2] < 0)
+    # 두 가지를 따로 본다. 평균이 오르는 것과 분산이 주는 것은 다른 주장이다.
+    claim2a = pos == cfg.n_fleet and cfg.n_fleet > 0      # 평균
+    claim2b = bool(dep.get("ok"))                          # 분산
+    claim2 = claim2a
     if dep:
-        print(f"    single {dep['single']:.3e}   union {dep['union']:.3e}   "
+        vals = dep.get("values") or {}
+        mu = lambda k: (sum(vals[k]) / len(vals[k])) if vals.get(k) else float("nan")
+        print(f"  (a) 성능   union 평균 {mu('union'):.5f}  ->  "
+              f"merged 평균 {mu('merged'):.5f}   "
+              f"{'병합이 높다' if mu('merged') > mu('union') else '병합이 낮다'}")
+        print(f"      같은 데이터에서 병합이 이긴 묶음 {pos}/{cfg.n_fleet}"
+              f"  (진 묶음 {neg})   {'성립' if claim2a else '불성립'}")
+        print(f"  (b) 분산   union {dep['union']:.3e}  ->  "
               f"merged {dep['merged']:.3e}   "
-              f"{'merged < union 성립' if claim2 else '불성립'}")
-        pos = sum(1 for k, v in cmp_.items()
-                  if k.startswith("fleet_") and "union" in k and v[1] > 0)
-        print(f"    같은 데이터에서 병합이 이긴 묶음 {pos}/{cfg.n_fleet}")
-        if cfg.n_fleet < 3:
-            print(f"    *** 묶음이 {cfg.n_fleet}개다. 분산 추정이 얇다.")
+              f"{'성립' if claim2b else '불성립'}   (single {dep['single']:.3e})")
+        if cfg.n_fleet < 5:
+            print(f"      *** 묶음이 {cfg.n_fleet}개다. (b) 의 분산 추정이 얇다. "
+                  f"(a) 가 더 믿을 만하다.")
 
     # ------------------------------------------------ 비용
     c = ev.get("cost") or {}
@@ -211,7 +223,8 @@ def main() -> None:
           + ("" if claim1 else "   생성에서 최고 단일과 all 을 이겨야 한다"))
     print(f"  기전  (구멍 메움) {'성립' if mech else '불성립'}"
           + ("" if mech else "   이득이 낮은 버킷에 몰려야 한다"))
-    print(f"  기여 2 (종속성)   {'성립' if claim2 else '불성립'}")
+    print(f"  기여 2 (같은 데이터) {'성립' if claim2 else '불성립'}"
+          + f"   성능 {'O' if claim2 else 'X'} / 분산 {'O' if claim2b else 'X'}")
     if claim1 and mech:
         print("  -> 다음 크기 점으로 넘어갈 단계. 같은 표를 base 를 바꿔 채운다.")
     print(f"  구간은 고정된 checkpoint 의 표본 불확실성이다. "

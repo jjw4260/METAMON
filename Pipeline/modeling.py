@@ -28,7 +28,18 @@ def setup_precision() -> str:
 
 
 def load_tokenizer(cfg: Config):
-    tok = AutoTokenizer.from_pretrained(cfg.base)
+    try:
+        tok = AutoTokenizer.from_pretrained(cfg.base)
+    except Exception as e:
+        if "gated" in str(e).lower() or "401" in str(e):
+            raise SystemExit(
+                f"\n{cfg.base} 은 게이트된 저장소다.\n"
+                f"  1) https://huggingface.co/{cfg.base} 에서 라이선스에 동의하고\n"
+                f"     os.environ['HF_TOKEN'] = '...' 을 설정하거나\n"
+                f"  2) 게이트 없는 같은 크기로 바꾼다:\n"
+                f"       --base Qwen/Qwen2.5-3B-Instruct    (3.1B)\n"
+                f"       --base microsoft/Phi-3-mini-4k-instruct  (3.8B)\n")
+        raise
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"          # 손실 계산용. 생성 시에만 left 로 바꾼다
