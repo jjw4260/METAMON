@@ -23,6 +23,7 @@ class EvalSet:
     """토크나이즈와 padding 을 한 번만 수행해 두는 평가 집합."""
 
     def __init__(self, items: Sequence[dict], tok, device: str, bs: int):
+        self.bs = bs
         pad = tok.pad_token_id
         order = sorted(range(len(items)),
                        key=lambda i: len(items[i]["pid"]) + len(items[i]["gid"]))
@@ -47,16 +48,50 @@ class EvalSet:
             ))
 
 
+# 한 번에 GPU 에 띄울 logits 의 상한. Llama-3.2 는 어휘가 128256 으로
+# TinyLlama(32000)의 4 배라, eval_bs=64 로 log_softmax 를 뜨면 10.5GB 가 든다.
+# 학습 상태가 64GB 를 잡고 있는 3B 에서는 그 자리에서 OOM 이다.
+LOGIT_BUDGET = 1.0e9          # 바이트
+
+
+def _chunk(es: "EvalSet", vocab: int, tlen: int) -> int:
+    """logits 가 LOGIT_BUDGET 을 넘지 않는 행 수."""
+    per = max(tlen * vocab * 4, 1)
+    return max(1, min(es.bs, int(LOGIT_BUDGET // per)))
+
+
+@torch.inference_mode()
+def _gold_logp(model, inp, att, msk, ch: int):
+    """gold 토큰의 log-probability. **log_softmax 를 만들지 않는다.**
+
+    logp = z[target] - logsumexp(z) 로 두면 (B, T, V) 짜리 출력 텐서가 한 번
+    더 뜨지 않는다. 그리고 행을 ch 개씩 끊어 forward 해서 logits 자체의 상주
+    량도 묶는다.
+    """
+    rows = []
+    for s0 in range(0, inp.shape[0], ch):
+        s1 = min(s0 + ch, inp.shape[0])
+        z = model(input_ids=inp[s0:s1],
+                  attention_mask=att[s0:s1]).logits[:, :-1]
+        g = z.gather(-1, inp[s0:s1, 1:].unsqueeze(-1)).squeeze(-1)
+        rows.append((g - torch.logsumexp(z, -1)).float())
+        del z, g
+    return torch.cat(rows, 0)
+
+
 @torch.inference_mode()
 def token_avg_logp(model, es: EvalSet) -> np.ndarray:
     """eq:mean_log_probability. 질의별 토큰 평균 log-probability."""
     out = np.empty(es.n)
+    ch = None
     for inp, att, msk, ntk, idx in es.batches:
-        lg = model(input_ids=inp, attention_mask=att).logits
-        lp = F.log_softmax(lg[:, :-1].float(), -1).gather(
-            -1, inp[:, 1:].unsqueeze(-1)).squeeze(-1)
-        out[idx] = ((lp * msk[:, 1:]).sum(1) / ntk).float().cpu().numpy()
-        del lg, lp
+        if ch is None:
+            v = int(model(input_ids=inp[:1, :2],
+                          attention_mask=att[:1, :2]).logits.shape[-1])
+            ch = _chunk(es, v, inp.shape[1])
+        lp = _gold_logp(model, inp, att, msk, ch)
+        out[idx] = ((lp * msk[:, 1:]).sum(1) / ntk).cpu().numpy()
+        del lp
     return out
 
 
@@ -110,14 +145,17 @@ def verdict(lo: float, hi: float) -> str:
 def token_probs(model, es: EvalSet) -> List[np.ndarray]:
     """질의별 gold 토큰 확률 벡터. 출력 앙상블 baseline 용."""
     out: List[Optional[np.ndarray]] = [None] * es.n
+    ch = None
     for inp, att, msk, ntk, idx in es.batches:
-        lg = model(input_ids=inp, attention_mask=att).logits
-        lp = F.log_softmax(lg[:, :-1].float(), -1).gather(
-            -1, inp[:, 1:].unsqueeze(-1)).squeeze(-1)
+        if ch is None:
+            v = int(model(input_ids=inp[:1, :2],
+                          attention_mask=att[:1, :2]).logits.shape[-1])
+            ch = _chunk(es, v, inp.shape[1])
+        lp = _gold_logp(model, inp, att, msk, ch)
         m = msk[:, 1:] > 0
         for j, i in enumerate(idx):
-            out[i] = lp[j][m[j]].exp().float().cpu().numpy()
-        del lg, lp
+            out[i] = lp[j][m[j]].exp().cpu().numpy()
+        del lp
     return out  # type: ignore
 
 

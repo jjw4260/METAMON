@@ -87,9 +87,13 @@ def token_logp(model, pids, gids, pad: int, device: str
                ) -> Tuple[torch.Tensor, torch.Tensor]:
     """토큰별 log-probability 와 mask. (bs, L-1) 두 개."""
     inp, att, msk = pack(pids, gids, pad, device)
-    lg = model(input_ids=inp, attention_mask=att).logits.float()
-    lp = F.log_softmax(lg[:, :-1], -1).gather(
-        -1, inp[:, 1:].unsqueeze(-1)).squeeze(-1)
+    # log_softmax 를 만들면 (bs, L, V) 텐서가 하나 더 생기고 autograd 가 그걸
+    # 붙든다. Llama-3.2 는 V=128256 이라 그 하나가 0.66GB 다. 같은 값을
+    #   logp = z[target] - logsumexp(z)
+    # 로 얻으면 그 텐서가 안 생긴다.
+    z = model(input_ids=inp, attention_mask=att).logits[:, :-1].float()
+    lp = (z.gather(-1, inp[:, 1:].unsqueeze(-1)).squeeze(-1)
+          - torch.logsumexp(z, -1))
     return lp, msk[:, 1:]
 
 
@@ -326,6 +330,9 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
             if broke:
                 log(f"  [{name}] p{t+1} period break (min p < tau2)")
             if health is not None and (t + 1) % 4 == 0:
+                # 단편화된 예약분을 먼저 돌려준다. 3B 에서 학습 상태가 64GB 를
+                # 잡고 있으면 평가가 들어갈 자리가 이것뿐이다.
+                torch.cuda.empty_cache()
                 ws.model.eval()
                 log(f"  [{name}] p{t+1} 상태 L(theta;1) = {health():.5f}")
                 ws.model.train()

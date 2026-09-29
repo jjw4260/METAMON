@@ -20,7 +20,12 @@ Source = Callable[[Key], torch.Tensor]
 
 
 def setup_precision() -> str:
-    """진단은 FP32. TF32 는 끈다."""
+    """진단은 FP32. TF32 는 끈다.
+
+    3B 이상에서는 단편화가 OOM 의 직접 원인이 된다. 실측에서 80GB 중
+    15.37GB 가 "reserved but unallocated" 로 묶여 있었다.
+    """
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
