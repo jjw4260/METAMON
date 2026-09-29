@@ -36,7 +36,12 @@ class Config:
     # 질의 필터는 **base 와 무관**해야 한다. surrogate 토크나이저로 거르면
     # base 를 바꿀 때마다 질의 집합이 달라져 캐시가 안 맞고 크기 비교가 깨진다.
     # 고정 토크나이저 하나로만 재고, 그 기준을 설정 해시에 박는다.
-    filter_tokenizer: str = "meta-llama/Llama-3.2-3B-Instruct"
+    # **이미 산 캐시를 살리려면 이 값이 첫 실행 때와 같아야 한다.** 필터는
+    # "고정" 이기만 하면 되고 어느 토크나이저인지는 상관없다. 첫 4992 질의를
+    # TinyLlama 토크나이저로 걸러서 샀으므로 그것을 기준으로 못박는다.
+    # 바꾸면 질의 집합이 달라져 캐시가 전부 빗나가고 돈을 다시 낸다.
+    # (게이트된 저장소를 기준으로 삼지 말 것. HF 토큰이 없으면 못 읽는다.)
+    filter_tokenizer: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
     max_prompt_tok: int = 96       # filter_tokenizer 기준 프롬프트 상한
     max_tok: int = 160             # 프롬프트 + Target 응답 상한
     seed: int = 17
