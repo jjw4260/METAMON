@@ -2,8 +2,10 @@
 """fleet 준비: Local K 개 + 전체 질의 단일 모델.
 
   - 이미 있는 arm 은 건너뛴다
-  - arm 마다 학습 직후 생존 관문을 통과해야 다음으로 넘어간다
-    (배율 1.0 또는 0.5 중 하나에서 L(theta;1) 이 BASE 보다 작아야 한다)
+  - arm 마다 학습 직후 생존 관문을 재고 **기록한다**. 못 넘어도 멈추지 않는다
+    (배율 1.0 또는 0.5 중 하나에서 L(theta;1) 이 BASE 보다 작아야 통과)
+    저장되는 가중치가 sel 최적 시점이므로, 그래도 못 넘는 arm 은 학습이 안 붙은
+    arm 이고 그것 자체가 결과다. 4 개가 못 넘으면 학습 설정이 틀린 것이라 멈춘다
   - 저장 가중치를 다시 읽어 질의별 log-probability 가 일치하는지 검증한다
 """
 from __future__ import annotations
@@ -62,7 +64,7 @@ def build_fleet(ws: WeightSpace, tok, cfg: Config, sp: Splits,
             failed.append(name)
         if len(failed) >= 4:
             raise SystemExit(
-                f"local {len(failed)}개가 자기 조각에서도 개선이 없다: {failed}\n"
+                f"arm {len(failed)}개가 기준선을 못 넘었다: {failed}\n"
                 f"학습 자체가 고장났다. lord_variant / lord_lr / period_chunk 를 볼 것.")
     if failed:
         log(f"\n  *** 생존 관문을 못 넘은 arm {failed}. 조립에는 들어가지만")
@@ -94,8 +96,8 @@ def _gate(ws: WeightSpace, cfg: Config, sel: EvalSet, name: str,
 
     `own` 이 있으면(비-IID local) **자기 조각**이 판정 기준이고 전체 혼합 sel
     은 참고로만 찍는다. 좁게 배운 모델이 전체에서 안 오르는 것은 고장이 아니라
-    설계의 결과다. `own` 이 없으면(union / all / IID local) 전체 혼합이 기준이며
-    거기서 못 오르면 학습이 고장난 것이므로 그 자리에서 멈춘다.
+    설계의 결과다. `own` 이 없으면(union / all / IID local) 전체 혼합이 기준이다.
+    어느 쪽이든 판정은 기록이고, 여기서 run 을 멈추지 않는다.
     """
     st = DeltaStore(ws, cfg, [name], log=lambda *_: None)
     src = lambda k: st.raw(name, k)
@@ -124,10 +126,13 @@ def _gate(ws: WeightSpace, cfg: Config, sel: EvalSet, name: str,
     log(f"  {name} 생존 L@1.0/0.5 최소 {best:.5f}  vs base {base_loss:.5f}  "
         f"{'통과' if ok else '실패'}")
     if not ok:
-        raise SystemExit(
-            f"{name}: 전체 질의로 학습했는데 BASE 를 개선하지 못했다. "
-            f"학습이 고장났다. 다음 arm 으로 넘어가지 않는다.")
-    return True
+        # 예전에는 여기서 멈췄다. arm 하나가 6 시간 run 을 죽였다. 저장되는 것이
+        # 이제 마지막 상태가 아니라 sel 최적 시점이므로, 그래도 BASE 를 못 넘는
+        # arm 은 "학습이 안 붙은 arm" 이고 그 사실 자체가 결과다. 기록만 하고
+        # 남은 arm 을 학습한다. 조립에서는 기여도가 0 에 가까울 것이다.
+        log(f"    *** 전체 질의로 학습했는데 BASE 를 못 넘었다. 기록만 하고 "
+            f"다음 arm 으로 간다.")
+    return ok
 
 
 def open_store(ws: WeightSpace, cfg: Config, log=print) -> DeltaStore:

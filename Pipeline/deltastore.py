@@ -53,17 +53,24 @@ def norms_path(cfg: Config) -> str:
 
 # ------------------------------------------------------------------ 저장
 def save_delta(ws: WeightSpace, cfg: Config, name: str,
-               state: Optional[Dict[Key, torch.Tensor]] = None) -> Dict[str, float]:
-    """현재 모델(또는 주어진 state)에서 Δw 를 뽑아 저장하고 norm 을 돌려준다.
+               state: Optional[Dict[Key, torch.Tensor]] = None,
+               delta: Optional[Dict[Key, torch.Tensor]] = None
+               ) -> Dict[str, float]:
+    """현재 모델(또는 주어진 state / delta)에서 Δw 를 뽑아 저장한다.
 
     학습 직후에 부르면 텐서가 이미 메모리에 있으므로 norm 계산이 공짜다.
+    `delta` 는 이미 Δw 인 dict 다. 학습 중 최적 시점을 CPU 에 떠 두었다가
+    그것을 저장할 때 쓴다.
     """
     dt = DT[cfg.delta_dtype]
     out, nrm = {}, {}
     for k in ws.keys:
-        w = (state[k].to(ws.device).float() if state is not None
-             else ws.lin[k].weight.detach().float())
-        d = (w - ws.base[k]).contiguous()
+        if delta is not None:
+            d = delta[k].float().contiguous()
+        else:
+            w = (state[k].to(ws.device).float() if state is not None
+                 else ws.lin[k].weight.detach().float())
+            d = (w - ws.base[k]).contiguous()
         nrm[skey(k)] = float(d.norm())
         out[skey(k)] = d.to(dt).cpu()
     tmp = st_path(cfg, name) + ".tmp"

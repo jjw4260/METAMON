@@ -57,7 +57,7 @@ import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
 from .config import Config
-from .deltastore import save_delta
+from .deltastore import DT, save_delta
 from .modeling import WeightSpace
 
 
@@ -201,7 +201,17 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
                data: Sequence[dict], seed: int,
                health: Optional[Callable[[], float]] = None,
                log=print) -> None:
-    """period 마다 재표집하고, 붕괴하면 즉시 멈춘다."""
+    """period 마다 재표집하고, 붕괴하면 즉시 멈춘다.
+
+    저장하는 것은 **마지막 상태가 아니라 sel 에서 가장 좋았던 시점**이다.
+    LoRD 에는 종료 조건이 없다. periods 를 질의 수에 맞춰 늘리면 질의가 많은
+    arm(union_g, <method>_all)은 수천 update 를 돌고, 그 궤적은 단조가 아니다.
+    실측(Llama-3.2-3B, base L 0.78472)에서 union_2 는 1.24735 -> 2.31814 ->
+    1.13844 로 진동했고 마지막 상태는 BASE 보다 나빴다. 마지막 상태를 저장하면
+    arm 의 품질이 궤적 위의 **아무 점**이 된다. 4 period 마다 sel 로 재고 가장
+    좋은 Δw 를 CPU 에 떠 두었다가 그것을 저장한다. sel 은 test 와 겹치지 않는다.
+    개선이 12 period 동안 없거나 BASE 의 2 배로 나빠지면 그 자리에서 멈춘다.
+    """
     pad = tok.pad_token_id
     ws.reset()
     ws.trainable(True)
@@ -218,6 +228,37 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
         f"변형 {cfg.lord_variant}  lambda1 {cfg.lambda1}  "
         f"sigmoid {cfg.use_sigmoid}")
     sat_warned = False
+
+    # ---- 최적 시점 보관. Δw 를 저장 정밀도 그대로 CPU 에 한 벌만 둔다.
+    #      3B fp16 이면 5.6GB 이고 저장할 때와 같은 값이라 손실이 더 없다.
+    dtd = DT[cfg.delta_dtype]
+    buf: Optional[Dict] = None
+    best_L: Optional[float] = None
+    best_t, stale, last_L = -1, 0, float("nan")
+    base_L = health() if health is not None else None
+
+    def keep(t: int) -> float:
+        """sel 로 재고, 좋아졌으면 그 Δw 를 떠 둔다. 돌려주는 값은 지금 상태."""
+        nonlocal buf, best_L, best_t, stale
+        torch.cuda.empty_cache()     # 학습 상태가 64GB 를 잡고 있다
+        ws.model.eval()
+        v = health()
+        ws.model.train()
+        if best_L is None or v < best_L:
+            if buf is None:
+                buf = {k: torch.empty(tuple(ws.base[k].shape), dtype=dtd,
+                                      device="cpu") for k in ws.keys}
+            for k in ws.keys:
+                buf[k].copy_((ws.lin[k].weight.detach().float()
+                              - ws.base[k]).to(dtd))
+            best_L, best_t, stale = v, t, 0
+            mark = "최적"
+        else:
+            stale += 1
+            mark = f"정체 {stale}"
+        log(f"  [{name}] p{t+1} 상태 L(theta;1) = {v:.5f}  {mark} "
+            f"(최적 p{best_t+1} {best_L:.5f})")
+        return v
 
     try:
         for t in range(periods):
@@ -329,13 +370,16 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
                 prev_p[i] = (float(p_pos[j]), float(p_neg[j]))
             if broke:
                 log(f"  [{name}] p{t+1} period break (min p < tau2)")
-            if health is not None and (t + 1) % 4 == 0:
-                # 단편화된 예약분을 먼저 돌려준다. 3B 에서 학습 상태가 64GB 를
-                # 잡고 있으면 평가가 들어갈 자리가 이것뿐이다.
-                torch.cuda.empty_cache()
-                ws.model.eval()
-                log(f"  [{name}] p{t+1} 상태 L(theta;1) = {health():.5f}")
-                ws.model.train()
+            if health is not None and ((t + 1) % 4 == 0 or t == periods - 1):
+                last_L = keep(t)
+                if base_L is not None and last_L > 2.0 * base_L:
+                    log(f"  [{name}] 발산 (L {last_L:.5f} > BASE {base_L:.5f} "
+                        f"의 2 배). 중단하고 최적 시점을 저장한다.")
+                    break
+                if stale >= 3:
+                    log(f"  [{name}] 12 period 동안 개선이 없다. 중단하고 "
+                        f"최적 시점을 저장한다.")
+                    break
     finally:
         jl.close()
         ws.model.eval()
@@ -343,4 +387,11 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
         del opt
         torch.cuda.empty_cache()
 
-    save_delta(ws, cfg, name)        # Δw 를 safetensors 로. 절대 가중치가 아니다
+    # Δw 를 safetensors 로. 절대 가중치가 아니다.
+    if buf is not None:
+        log(f"  [{name}] 저장 = p{best_t+1} 시점 (sel L {best_L:.5f}). "
+            f"마지막 상태는 {last_L:.5f} 였다.")
+        save_delta(ws, cfg, name, delta=buf)
+        buf = None
+    else:
+        save_delta(ws, cfg, name)
