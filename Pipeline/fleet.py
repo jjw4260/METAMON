@@ -101,30 +101,34 @@ def _gate(ws: WeightSpace, cfg: Config, sel: EvalSet, name: str,
     """
     st = DeltaStore(ws, cfg, [name], log=lambda *_: None)
     src = lambda k: st.raw(name, k)
-    best, best_own = None, None
-    for s in (1.0, 0.5):
+    # **판정은 배율 1.0 에서만 한다.** 실행 3 의 single(arm) 이 쓰는 배율이
+    # 1.0 이다. 예전에는 1.0 과 0.5 중 더 좋은 쪽으로 판정해서, 13 arm 전부가
+    # 1.0 에서 BASE 보다 나쁜데도 전부 "통과" 로 찍혔다. 0.5 / 0.25 는 참고로만
+    # 남긴다 (Δw 가 방향은 맞고 크기만 큰지 보는 눈).
+    scales = (1.0, 0.5, 0.25)
+    v, v_own = {}, {}
+    for s in scales:
         ws.apply(src, s)
-        v = loss(ws.model, sel)
-        best = v if best is None else min(best, v)
+        v[s] = loss(ws.model, sel)
         if own is not None:
-            w = loss(ws.model, own)
-            best_own = w if best_own is None else min(best_own, w)
+            v_own[s] = loss(ws.model, own)
     ws.reset()
     st.close()
+    ref = "  ".join(f"@{s}={v[s]:.5f}" for s in scales)
 
     if own is not None:
-        ok = best_own < base_own
-        log(f"  {name} 생존 자기조각 {best_own:.5f} vs base {base_own:.5f}  "
-            f"{'통과' if ok else '실패'}   "
-            f"(전체 sel {best:.5f} vs {base_loss:.5f} "
-            f"{'+' if best < base_loss else '-'})")
+        ok = v_own[1.0] < base_own
+        log(f"  {name} 생존 자기조각 @1.0 {v_own[1.0]:.5f} vs base "
+            f"{base_own:.5f}  {'통과' if ok else '실패'}   "
+            f"(자기조각 " + "  ".join(f"@{s}={v_own[s]:.5f}" for s in scales)
+            + f" / 전체 sel {ref} vs {base_loss:.5f})")
         if not ok:
-            log(f"    *** 자기 조각에서도 개선이 없다. 학습이 안 붙었다.")
+            log(f"    *** 자기 조각에서도 배율 1.0 이 BASE 를 못 넘었다.")
         return ok
 
-    ok = best < base_loss
-    log(f"  {name} 생존 L@1.0/0.5 최소 {best:.5f}  vs base {base_loss:.5f}  "
-        f"{'통과' if ok else '실패'}")
+    ok = v[1.0] < base_loss
+    log(f"  {name} 생존 @1.0 {v[1.0]:.5f}  vs base {base_loss:.5f}  "
+        f"{'통과' if ok else '실패'}   (sel {ref})")
     if not ok:
         # 예전에는 여기서 멈췄다. arm 하나가 6 시간 run 을 죽였다. 저장되는 것이
         # 이제 마지막 상태가 아니라 sel 최적 시점이므로, 그래도 BASE 를 못 넘는

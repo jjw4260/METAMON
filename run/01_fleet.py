@@ -43,6 +43,8 @@ def main() -> None:
     ap.add_argument("--lord-variant", default=None, choices=["code", "paper"],
                     help="code=train_pod2.py:963 그대로(기본), paper=Eq.10 의 clip 포함")
     ap.add_argument("--lambda1", type=float, default=None)
+    ap.add_argument("--lord-lr", type=float, default=None,
+                    help="비우면 config 기본값(7.5e-6). base 가 강하면 더 줄인다")
     # 분할 크기는 여기서 고정되어 ckpt/config.json 에 박힌다. 실행 2, 3 은
     # 그 파일을 읽으므로 나중에 바꿀 수 없다. 실행 0 의 질의 수와 맞출 것.
     ap.add_argument("--n-train", type=int, default=None)
@@ -68,6 +70,8 @@ def main() -> None:
         cfg.lord_variant = a.lord_variant
     if a.lambda1 is not None:
         cfg.lambda1 = a.lambda1
+    if a.lord_lr is not None:
+        cfg.lord_lr = a.lord_lr
     if a.shard is not None:
         cfg.shard = a.shard
     cfg.makedirs()

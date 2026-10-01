@@ -128,7 +128,17 @@ class Config:
     tau2: float = 0.4              # period break 임계 (train_pod2.py)
     log_clip_eps: float = 0.2      # rlhf_train.log_clip. 토큰 단위 clip
     use_sigmoid: bool = True       # Eq.11 의 σ(·). 코드 기본 분기도 sigmoid 다
-    lord_lr: float = 3e-5          # 논문 §5.1
+    # 논문 §5.1 은 3e-5 다. 그 값은 1.1B(base L 1.92958)에서는 맞았지만
+    # Llama-3.2-3B(base L 0.78472)에서는 과도했다. 13 arm 전부를 배율별로 다시
+    # 재 보니 **같은 모양**이 나왔다 (run/01b_audit.py):
+    #   arm        L@1.0    L@0.5   L@0.25      BASE = 0.78472
+    #   local_0   0.92378  0.64219  0.57212
+    #   union_0   1.03053  0.67843  0.57978
+    #   lord_all  1.24758  0.71960  0.57945
+    # 방향은 맞고 **크기만 4 배쯤 크다**. 13 번의 고장이 아니라 한 개의 상수다.
+    # 저장 시점을 최적으로 바꾸는 것만으로는 부족하다. union_0 의 궤적에서 측정된
+    # 최저값이 0.88812 로 이미 BASE 보다 나빴다. 보폭 자체를 줄여야 한다.
+    lord_lr: float = 7.5e-6        # = 3e-5 / 4. 위 측정에서 나온 배수다
     # periods = 0 이면 arm 의 질의 수에 맞춰 자동으로 잡는다.
     #   periods = ceil(len(data) / period_chunk) * lord_epochs
     # 고정값을 쓰면 질의를 많이 가진 arm(union_g, <fleet>_all)이 자기 데이터를
