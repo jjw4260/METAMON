@@ -79,10 +79,13 @@ def main() -> None:
     if g:
         print(f"[greedy] 기준 {g.get('on')}  시작 {g.get('start')}  "
               f"채택 {g.get('picked')}")
+        # 03 이 남기는 키는 build_check(만든 절반) 와 verify_check(남긴 절반)다.
+        bc, vc = g.get("build_check") or {}, g.get("verify_check") or {}
         print(f"         soup {len(g.get('soup_members', []))}개 "
-              f"check {g.get('soup_check', float('nan')):.5f}  |  "
-              f"metamon 칸 {g.get('cells_taken')}/{g.get('cells_tried')} "
-              f"check {g.get('metamon_check', float('nan')):.5f}")
+              f"{g.get('soup_members', [])}  |  "
+              f"metamon 칸 {g.get('cells_taken')}/{g.get('cells_tried')}")
+        print(f"         만든 절반  " + "  ".join(f"{k} {v:.5f}" for k, v in bc.items()))
+        print(f"         검증 절반  " + "  ".join(f"{k} {v:.5f}" for k, v in vc.items()))
 
     # ------------------------------------------------ 전제
     sk = ev.get("shard_skew") or {}
