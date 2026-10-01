@@ -44,6 +44,14 @@ class Config:
     filter_tokenizer: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
     max_prompt_tok: int = 96       # filter_tokenizer 기준 프롬프트 상한
     max_tok: int = 160             # 프롬프트 + Target 응답 상한
+    # Target 응답(gid) 끝에 EOS 를 붙인다. 붙이지 않으면 LoRD 가 끝맺음을
+    # 지운다: y_vic 에는 EOS 가 없고 모델 표본 y- 는 첫 EOS 까지 잘라 쓰므로,
+    # log P(y-) 를 끌어내리는 항이 EOS 확률만 한쪽으로 깎는다. 3B 런에서
+    # local_0·1·2·5 와 lord_all 이 번역을 맞게 하고도 "Assistant:" 를 찍으며
+    # 같은 문장을 되풀이했다 (평균 32~50 단어, 고유어 비율 0.35~0.57,
+    # BASE 25 단어 0.87). sel L 은 EOS 없는 gid 로 재므로 이 손상을 못 봤다.
+    # 이 필드가 없는 예전 config.json 은 load() 가 False 로 읽어 그대로 재현한다.
+    gold_eos: bool = True
     seed: int = 17
 
     # ---------------- Target Model (victim) ----------------
@@ -287,7 +295,9 @@ class Config:
 
 def load(path: str) -> Config:
     raw = json.load(open(path, encoding="utf-8"))
-    return Config(**raw.get("cfg", raw))
+    cfg = dict(raw.get("cfg", raw))
+    cfg.setdefault("gold_eos", False)      # 이 필드 이전의 run 은 EOS 없이 학습했다
+    return Config(**cfg)
 
 
 def load_extra(path: str) -> dict:

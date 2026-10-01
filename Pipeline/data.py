@@ -97,12 +97,15 @@ def attach(items: Sequence[Item], responses: Sequence[str], cfg: Config, tok,
         room = cfg.max_tok - len(it["pid"])
         if room < 1:
             raise SystemExit("max_tok 이 프롬프트보다 짧다. 설정을 확인할 것.")
-        if len(gid) > room:
-            gid = gid[:room]
+        # EOS 를 붙일 자리를 먼저 뺀다. 응답이 잘렸어도 끝맺음은 배워야 한다.
+        keep = room - 1 if cfg.gold_eos else room
+        if len(gid) > keep:
+            gid = gid[:keep]
             cut += 1
         if len(gid) == 0:
-            gid = [tok.eos_token_id]
             empty += 1
+        if cfg.gold_eos or len(gid) == 0:
+            gid = list(gid) + [tok.eos_token_id]
         d = dict(it)
         d.update({"gold": g, "gid": gid, "ntok": len(gid)})
         out.append(d)
