@@ -70,7 +70,7 @@ def save_delta(ws: WeightSpace, cfg: Config, name: str,
         else:
             w = (state[k].to(ws.device).float() if state is not None
                  else ws.lin[k].weight.detach().float())
-            d = (w - ws.base[k]).contiguous()
+            d = (w - ws.base[k].to(w.device)).contiguous()
         nrm[skey(k)] = float(d.norm())
         out[skey(k)] = d.to(dt).cpu()
     tmp = st_path(cfg, name) + ".tmp"
@@ -168,7 +168,8 @@ class DeltaStore:
 
     def state(self, name: str, key: Key) -> torch.Tensor:
         """복원용 절대 가중치 = BASE + Δw."""
-        return self.ws.base[key] + self.raw(name, key)
+        r = self.raw(name, key)
+        return self.ws.base[key].to(r.device) + r
 
     def rel_delta(self, name: str) -> float:
         """‖Δw‖ / ‖w_BASE‖. 학습이 얼마나 움직였는지."""

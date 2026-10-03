@@ -249,8 +249,8 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
                 buf = {k: torch.empty(tuple(ws.base[k].shape), dtype=dtd,
                                       device="cpu") for k in ws.keys}
             for k in ws.keys:
-                buf[k].copy_((ws.lin[k].weight.detach().float()
-                              - ws.base[k]).to(dtd))
+                w = ws.lin[k].weight.detach().float()
+                buf[k].copy_((w - ws.base[k].to(w.device, non_blocking=True)).to(dtd))
             best_L, best_t, stale = v, t, 0
             mark = "최적"
         else:
