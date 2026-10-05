@@ -14,11 +14,17 @@ Method 대로:
 모델마다 Colab 로컬 디스크에 먼저 저장하고, Drive 로 복사한 뒤 크기와 읽기를
 확인한다. Drive 에서 바로 이름을 바꾸다 파일이 사라진 일이 있었다 (local_6).
 이미 Drive 에 있는 모델은 건너뛴다. 끊겨도 같은 명령으로 이어 간다.
+
+모델 하나는 **별도 프로세스**에서 학습한다. 한 프로세스에서 이어 돌리면 앞 모델의
+GPU 메모리가 순환 참조 때문에 다 풀리지 않아, Qwen2.5-3B 다음 Phi-3-mini 가 첫
+update 에서 OOM 이 났다. 프로세스가 끝나면 메모리는 남김없이 돌아온다.
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import subprocess
 import os
 import shutil
 import sys
@@ -122,6 +128,27 @@ def train_one(name: str, a, device: str, log=print) -> dict:
     return info
 
 
+GATED = 3
+
+
+def child(a) -> None:
+    """모델 하나를 학습하고 manifest 에 그 항목만 써 넣는다."""
+    device = setup_precision()
+    try:
+        info = train_one(a.only, a, device)
+    except (SystemExit, Exception) as e:
+        msg = str(e)
+        if "게이트" in msg or "gated" in msg.lower() or "403 Client" in msg:
+            sys.exit(GATED)
+        raise
+    mpath = os.path.join(a.out, "manifest.json")
+    man = json.load(open(mpath, encoding="utf-8"))
+    man["locals"][a.only] = info
+    json.dump(man, open(mpath, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    del info
+    gc.collect()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="/content/runs/l32/target/dataset.json")
@@ -132,7 +159,10 @@ def main():
                     help="같은 설정으로 X 전체에 학습한 theta 의 Δw. 없으면 여기서 학습")
     ap.add_argument("--locals", nargs="*", default=DEFAULT_LOCALS)
     ap.add_argument("--lord-lr", type=float, default=None)
+    ap.add_argument("--only", default=None, help="(내부용) 이 모델 하나만 학습한다")
     a = ap.parse_args()
+    if a.only:
+        return child(a)
 
     device = setup_precision()
     os.makedirs(a.out, exist_ok=True)
@@ -167,18 +197,19 @@ def main():
         if name in man["locals"] and os.path.exists(dst):
             print(f"\n[{s}] 이미 있음. 건너뜀")
             continue
-        print(f"\n========== {name} ==========")
-        try:
-            man["locals"][name] = train_one(name, a, device)
-        except (SystemExit, Exception) as e:
-            msg = str(e)
-            if "게이트" in msg or "gated" in msg.lower() or "403 Client" in msg:
-                print(f"*** {name}: 게이트된 저장소라 건너뛴다. "
-                      f"https://huggingface.co/{name} 에서 라이선스에 동의한 뒤 다시 돌릴 것.")
-                torch.cuda.empty_cache()
-                continue
-            raise
-        save()
+        print(f"\n========== {name} ==========", flush=True)
+        cmd = [sys.executable, "-u", os.path.abspath(__file__), "--only", name,
+               "--data", a.data, "--out", a.out, "--local-dir", a.local_dir]
+        if a.lord_lr is not None:
+            cmd += ["--lord-lr", str(a.lord_lr)]
+        rc = subprocess.run(cmd).returncode
+        if rc == GATED:
+            print(f"*** {name}: 게이트된 저장소라 건너뛴다. "
+                  f"https://huggingface.co/{name} 에서 라이선스에 동의한 뒤 다시 돌릴 것.")
+            continue
+        if rc != 0:
+            raise SystemExit(f"{name} 학습 실패 (종료코드 {rc}). 위 출력이 원인이다.")
+        man = json.load(open(mpath, encoding="utf-8"))
 
     print("\n[요약]  sel L(theta;1)")
     print(f"  {'모델':32s} {'base':>8s} {'@1.0':>8s} {'@0.5':>8s} {'@0.25':>8s}  판정")
