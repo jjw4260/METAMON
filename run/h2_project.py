@@ -46,7 +46,7 @@ from Pipeline.data import load_dataset_file
 from Pipeline.hetero import ot as OT
 from Pipeline.hetero import sensitivity as SE
 from Pipeline.hetero.load import RoleDelta, load_tok, load_trained
-from Pipeline.hetero.mapping import chunks
+from Pipeline.hetero.mapping import solve_maps
 from Pipeline.hetero.roles import IN_KIND, ROLES, check_roles
 from Pipeline.lord import mean_logp, token_logp
 from Pipeline.modeling import setup_precision
@@ -160,27 +160,38 @@ def plans_for(Pt, Pk, a, log=print):
 
 
 # ------------------------------------------------------------------ 메모리 묶음
-def groups_by_budget(th, lo, pairs, G, budget):
-    """theta 층을 앞에서부터 묶는다. 회귀 통계(교차항 + gamma 별 해 + 산포) 추정 크기가
-    budget 을 넘지 않게. 입력 회귀는 같은 kind 의 역할(Q/K/V, Gate/Up)이 공유한다."""
-    regs_in = {(l, i, IN_KIND[r]) for r, ps in pairs.items() for l, i, _ in ps}
-    regs_out = {(l, i, r) for r, ps in pairs.items() for l, i, _ in ps}
-    by_l: Dict[int, float] = {}
-    for l, i, k in regs_in:
-        by_l[l] = by_l.get(l, 0.0) + th.in_dim(k) * lo.in_dim(k) * 4 * (1 + G)
-    for l, k in {(l, k) for l, _, k in regs_in}:
-        by_l[l] += th.in_dim(k) ** 2 * 4
-    for l, i, r in regs_out:
-        by_l[l] = by_l.get(l, 0.0) + lo.out_dim(r) * (th.out_dim(r) * (1 + G) + lo.out_dim(r)) * 4
-    out, cur, s = [], [], 0.0
-    for l in sorted(by_l):
-        if cur and s + by_l[l] > budget:
-            out.append(cur)
-            cur, s = [], 0.0
-        cur.append(l)
-        s += by_l[l]
-    if cur:
-        out.append(cur)
+def subsets_by_budget(th, lo, pairs, budget):
+    """theta 층마다 local 층을 묶는다. 한 묶음의 GPU 추정량
+        x 산포(theta 입력, local 출력) + 교차항 전부 + 가장 큰 x 묶음의 교차항(gamma 후보 해)
+        + 여유 2GB
+    가 budget 을 넘지 않게. 쌍 (l, i) 의 입력·출력 회귀는 같은 묶음에 들어간다.
+    반환 {l: [[i, ...], ...]}"""
+    by = {}
+    for r, ps in pairs.items():
+        for l, i, _ in ps:
+            by.setdefault(l, {}).setdefault(i, set()).add(r)
+    out = {}
+    for l, im in sorted(by.items()):
+        def est(ii):
+            kinds = {IN_KIND[r] for i in ii for r in im[i]}
+            v = sum(th.in_dim(k) ** 2 * 4 for k in kinds)
+            grp = {}
+            for i in ii:
+                for k in {IN_KIND[r] for r in im[i]}:
+                    x = th.in_dim(k) * lo.in_dim(k) * 4
+                    v += x
+                    grp[k] = grp.get(k, 0) + x
+                for r in im[i]:
+                    v += lo.out_dim(r) * (th.out_dim(r) + lo.out_dim(r)) * 4
+            return v + max(grp.values(), default=0) + 2e9
+        subs, cur = [], []
+        for i in sorted(im):
+            if cur and est(cur + [i]) > budget:
+                subs.append(cur)
+                cur = []
+            cur.append(i)
+        subs.append(cur)
+        out[l] = subs
     return out
 
 
@@ -227,43 +238,49 @@ def project_one(name, info, th, ttok, titems, Pt, a, device, log=print):
     D = RoleDelta(lo, info["delta"], device)
     Z: Dict[str, torch.Tensor] = {}
     rec = []
-    groups = groups_by_budget(th, lo, pairs, len(a.gammas), a.budget_gb * 1e9)
-    log(f"[{s}] 회귀 {len(need_in)} + {len(need_out)}  theta 층 묶음 {len(groups)}개")
+    subs = subsets_by_budget(th, lo, pairs, a.budget_gb * 1e9)
+    log(f"[{s}] 회귀 {len(need_in)} + {len(need_out)}  theta 층 {len(subs)}개  "
+        f"묶음 {sum(len(v) for v in subs.values())}개 (예산 {a.budget_gb}GB)")
     t0 = time.time()
-    for g in groups:
-        gs = set(g)
-        gen = chunks(th, ttok, lo, ltok, fit, gsel, held,
-                     {x for x in need_in if x[0] in gs}, {x for x in need_out if x[0] in gs},
-                     a.gammas, chunk=10 ** 6, bs=a.bs, device=device, log=log)
-        for tls, res in gen:
-            for l in tls:
-                for r in ROLES:
-                    acc = None
-                    for l2, i, mass in pairs[r]:
-                        if l2 != l:
-                            continue
-                        ri = res[("in", l, i, IN_KIND[r])]
-                        ro = res[("out", l, i, r)]
-                        ok = ri["r2"] >= a.r2_min and ro["r2"] >= a.r2_min
-                        rec.append({"l": l, "i": i, "role": r, "m": mass, "pass": bool(ok),
-                                    "r2_in": ri["r2"], "r2_out": ro["r2"],
-                                    "c_in": ri["c"], "c_out": ro["c"]})
-                        if not ok:
-                            continue
-                        # Δz = OutputMap Δw InputMap,  OutputMap = B_out^T, InputMap = B_in^T
-                        t = ro["B"].T @ D.get(i, r) @ ri["B"].T
-                        if t.shape != th.weight(l, r).shape:
-                            raise SystemExit(f"Δz 모양 {tuple(t.shape)} != w_theta "
-                                             f"{tuple(th.weight(l, r).shape)} ({l}.{r} <- {i})")
-                        acc = t.mul_(mass) if acc is None else acc.add_(t, alpha=mass)
-                    if acc is not None:
-                        if not torch.isfinite(acc).all():
-                            raise SystemExit(f"Δz {l}.{r} 에 nan/inf")
-                        Z[f"{l}.{r}"] = acc.to(torch.bfloat16).cpu()
+    for l, sl in subs.items():
+        acc: Dict[str, torch.Tensor] = {}
+        for ii in sl:
+            iset = set(ii)
+            torch.cuda.reset_peak_memory_stats()
+            res = solve_maps(th, ttok, lo, ltok, fit, gsel, held,
+                             {x for x in need_in if x[0] == l and x[1] in iset},
+                             {x for x in need_out if x[0] == l and x[1] in iset},
+                             a.gammas, bs=a.bs, device=device, log=log)
+            for r in ROLES:
+                for l2, i, mass in pairs[r]:
+                    if l2 != l or i not in iset:
+                        continue
+                    ri = res[("in", l, i, IN_KIND[r])]
+                    ro = res[("out", l, i, r)]
+                    ok = ri["r2"] >= a.r2_min and ro["r2"] >= a.r2_min
+                    rec.append({"l": l, "i": i, "role": r, "m": mass, "pass": bool(ok),
+                                "r2_in": ri["r2"], "r2_out": ro["r2"],
+                                "c_in": ri["c"], "c_out": ro["c"]})
+                    if not ok:
+                        continue
+                    # Δz = OutputMap Δw InputMap,  OutputMap = B_out^T, InputMap = B_in^T
+                    t = ro["B"].T @ D.get(i, r) @ ri["B"].T
+                    if t.shape != th.weight(l, r).shape:
+                        raise SystemExit(f"Δz 모양 {tuple(t.shape)} != w_theta "
+                                         f"{tuple(th.weight(l, r).shape)} ({l}.{r} <- {i})")
+                    if r in acc:
+                        acc[r].add_(t, alpha=mass)
+                    else:
+                        acc[r] = t.mul_(mass)
+                    del t
             del res
             torch.cuda.empty_cache()
-        done = sum(len(x) for x in groups[:groups.index(g) + 1])
-        log(f"    [{s}] theta 층 {done}/{th.L}  {time.time() - t0:.0f}s")
+        for r, v in acc.items():
+            if not torch.isfinite(v).all():
+                raise SystemExit(f"Δz {l}.{r} 에 nan/inf")
+            Z[f"{l}.{r}"] = v.to(torch.bfloat16).cpu()
+        del acc
+        log(f"    [{s}] theta 층 {l + 1}/{th.L}  {time.time() - t0:.0f}s")
 
     # 요약
     summ = {"plan": a.plan, "r2_min": a.r2_min, "roles": {}}
@@ -331,7 +348,8 @@ def main():
     ap.add_argument("--n-held", type=int, default=128, help="sel (train 다음)")
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--sens-bs", type=int, default=8)
-    ap.add_argument("--budget-gb", type=float, default=24.0)
+    ap.add_argument("--budget-gb", type=float, default=30.0,
+                    help="회귀 통계 GPU 예산. 두 모델(fp32, 최대 28GB)은 따로")
     a = ap.parse_args()
     a.out = a.out or os.path.dirname(a.manifest)
     os.makedirs(a.local_dir, exist_ok=True)

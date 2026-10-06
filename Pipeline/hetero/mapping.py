@@ -10,8 +10,14 @@ gamma 를 판정 데이터로 고르면 판정이 낙관적으로 된다. 그래
 activation 은 두 모델에 **같은 문자열**을 넣고 단어 구간 c 로 평균한 것이다 (spans).
 모델은 fp32 로 올린다. Δw 는 BASE 대비 1e-3 수준이라 bf16 이면 학습 결과가 묻힌다.
 
-한 번에 theta 층 몇 개만 다룬다. 회귀 통계가 층마다 수 GB 라 전부 동시에 둘 수 없다.
-묶음마다 결과를 돌려주고, 호출한 쪽이 Δz 를 계산한 뒤 버린다.
+한 번에 주어진 회귀 묶음만 푼다. 호출한 쪽(h2)이 메모리 추정으로 묶음을 나누고,
+결과로 Δz 를 계산한 뒤 버린다.
+
+GPU 에 동시에 두는 것은 적합 통계(교차항, x 산포)와 회귀마다 **고른 gamma 의 해 하나**
+뿐이다. gamma 후보의 해를 전부 들고 있지 않는다. x 를 공유하는 회귀 묶음마다
+gamma 하나씩 풀어 gsel R^2 를 바로 재고 더 나은 해만 남긴다. 묶음이 끝나면 그
+교차항과 x 산포를 버린다. gsel / held activation 은 작아서(질의 128 개) 먼저 한 번
+뽑아 CPU 에 두고, 잴 때만 변수 하나씩 GPU 로 올린다.
 """
 from __future__ import annotations
 
@@ -21,7 +27,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import torch
 
 from . import spans as SP
-from .ridge import Held, Reg, Var, solve_group
+from .ridge import Reg, Var, chol
 from .roles import KINDS, ROLES, Arch, StopForward
 
 
@@ -67,18 +73,43 @@ def _pool(acts, idx):
     return out / cnt
 
 
-def chunks(th: Arch, ttok, lo: Arch, ltok, fit, gsel, held,
-           need_in: Iterable[Tuple[int, int, str]],
-           need_out: Iterable[Tuple[int, int, str]],
-           gammas: Sequence[float], chunk: int, bs: int, device: str, log=print):
+def _r2(Xc: torch.Tensor, Y: torch.Tensor, mu_y: torch.Tensor, B: torch.Tensor) -> float:
+    """R^2 = 1 - SSE/SST.  SSE 는 적합 평균 기준, SST 는 그 데이터 자신의 평균 기준."""
+    r = (Y - mu_y) - Xc @ B
+    sse = float((r.double() ** 2).sum())
+    sst = float(((Y - Y.mean(0)).double() ** 2).sum())
+    return 1.0 - sse / sst if sst > 0 else float("nan")
+
+
+def solve_maps(th: Arch, ttok, lo: Arch, ltok, fit, gsel, held,
+               need_in: Iterable[Tuple[int, int, str]],
+               need_out: Iterable[Tuple[int, int, str]],
+               gammas: Sequence[float], bs: int, device: str, log=print):
     """need_in  = {(l, i, kind)}   InputMap: theta 입력 -> local 입력
     need_out = {(l, i, role)}   OutputMap: local 출력 -> theta 출력
 
-    theta 층 묶음마다 (묶음 층들, 결과) 를 낸다. 결과[(종류, l, i, 이름)] =
+    반환 결과[(종류, l, i, 이름)] =
         {"B": Map^T (d_x x d_y), "c": 고른 gamma 배수, "r2": 판정 R^2, "r2_gsel": {c: R^2}}
     """
-    need_in, need_out = set(need_in), set(need_out)
-    tl_all = sorted({l for l, _, _ in need_in | need_out})
+    t0 = time.time()
+    need_in, need_out = sorted(set(need_in)), sorted(set(need_out))
+    tls = sorted({l for l, _, _ in need_in + need_out})
+    lis = sorted({i for _, i, _ in need_in + need_out})
+    t_ins = sorted({(l, k) for l, _, k in need_in})
+    t_outs = sorted({(l, r) for l, _, r in need_out})
+    l_ins = sorted({(i, k) for _, i, k in need_in})
+    l_outs = sorted({(i, r) for _, i, r in need_out})
+    dims = {}
+    for l, k in t_ins:
+        dims[("t", "in", l, k)] = (th.in_dim(k), True)
+    for l, r in t_outs:
+        dims[("t", "out", l, r)] = (th.out_dim(r), False)
+    for i, k in l_ins:
+        dims[("l", "in", i, k)] = (lo.in_dim(k), False)
+    for i, r in l_outs:
+        dims[("l", "out", i, r)] = (lo.out_dim(r), True)
+    regs = ([(("in", l, i, k), ("t", "in", l, k), ("l", "in", i, k)) for l, i, k in need_in]
+            + [(("out", l, i, r), ("l", "out", i, r), ("t", "out", l, r)) for l, i, r in need_out])
     pre = {nm: [SP.text_of(x) for x in d] for nm, d in
            (("fit", fit), ("gsel", gsel), ("held", held))}
 
@@ -93,97 +124,76 @@ def chunks(th: Arch, ttok, lo: Arch, ltok, fit, gsel, held,
             if sum(len(k) for k in keep):
                 yield ia, wa, ib, wb, keep
 
-    for c0 in range(0, len(tl_all), chunk):
-        t0 = time.time()
-        tls = tl_all[c0:c0 + chunk]
-        Rin = sorted(x for x in need_in if x[0] in tls)
-        Rout = sorted(x for x in need_out if x[0] in tls)
-        lis = sorted({i for _, i, _ in Rin + Rout})
-        t_ins = sorted({(l, k) for l, _, k in Rin})
-        t_outs = sorted({(l, r) for l, _, r in Rout})
-        l_ins = sorted({(i, k) for _, i, k in Rin})
-        l_outs = sorted({(i, r) for _, i, r in Rout})
-
-        V: Dict[tuple, Var] = {}
+    def pooled(ia, wa, ib, wb, keep):
+        a = _run(th, ttok, ia, t_ins, t_outs, max(tls), device)
+        b = _run(lo, ltok, ib, l_ins, l_outs, max(lis), device)
+        xa, xb = _pool_index(wa, keep, device), _pool_index(wb, keep, device)
+        Z = {}
         for l, k in t_ins:
-            V[("t", "in", l, k)] = Var(th.in_dim(k), True, device)
+            Z[("t", "in", l, k)] = _pool(a[("in", l, k)], xa)
         for l, r in t_outs:
-            V[("t", "out", l, r)] = Var(th.out_dim(r), False, device)
+            Z[("t", "out", l, r)] = _pool(a[("out", l, r)], xa)
         for i, k in l_ins:
-            V[("l", "in", i, k)] = Var(lo.in_dim(k), False, device)
+            Z[("l", "in", i, k)] = _pool(b[("in", i, k)], xb)
         for i, r in l_outs:
-            V[("l", "out", i, r)] = Var(lo.out_dim(r), True, device)
-        regs = []      # (결과키, x키, y키, Reg)
-        for l, i, k in Rin:
-            xk, yk = ("t", "in", l, k), ("l", "in", i, k)
-            regs.append((("in", l, i, k), xk, yk, Reg(V[xk], V[yk])))
-        for l, i, r in Rout:
-            xk, yk = ("l", "out", i, r), ("t", "out", l, r)
-            regs.append((("out", l, i, r), xk, yk, Reg(V[xk], V[yk])))
+            Z[("l", "out", i, r)] = _pool(b[("out", i, r)], xb)
+        return Z
 
-        def pooled(ia, wa, ib, wb, keep):
-            a = _run(th, ttok, ia, t_ins, t_outs, max(tls), device)
-            b = _run(lo, ltok, ib, l_ins, l_outs, max(lis), device)
-            xa, xb = _pool_index(wa, keep, device), _pool_index(wb, keep, device)
-            Z = {}
-            for l, k in t_ins:
-                Z[("t", "in", l, k)] = _pool(a[("in", l, k)], xa)
-            for l, r in t_outs:
-                Z[("t", "out", l, r)] = _pool(a[("out", l, r)], xa)
-            for i, k in l_ins:
-                Z[("l", "in", i, k)] = _pool(b[("in", i, k)], xb)
-            for i, r in l_outs:
-                Z[("l", "out", i, r)] = _pool(b[("out", i, r)], xb)
-            return Z
+    # ---- gsel / held activation (CPU)
+    cache = {}
+    for nm in ("gsel", "held"):
+        parts = {key: [] for key in dims}
+        for bt in batches(nm):
+            for key, z in pooled(*bt).items():
+                parts[key].append(z.cpu())
+        cache[nm] = {key: torch.cat(v) for key, v in parts.items()}
+        del parts
 
-        # ---- 적합
-        n_sp = 0
-        for bt in batches("fit"):
-            Z = pooled(*bt)
-            Zc = {key: V[key].add(z) for key, z in Z.items()}
-            n_sp += next(iter(Z.values())).shape[0]
-            for _, xk, yk, rg in regs:
-                rg.add(Zc[xk], Zc[yk])
-        maps = {}
-        groups: Dict[tuple, list] = {}
-        for _, xk, _, rg in regs:
-            groups.setdefault(xk, []).append(rg)
-        for xk, rgs in groups.items():
-            maps.update(solve_group(V[xk], rgs, gammas))
-        for _, _, _, rg in regs:
-            rg.Sxy = None
+    # ---- 적합 통계
+    V = {key: Var(d, sec, device) for key, (d, sec) in dims.items()}
+    R = {rk: Reg(V[xk], V[yk]) for rk, xk, yk in regs}
+    n_sp = 0
+    for bt in batches("fit"):
+        Z = pooled(*bt)
+        Zc = {key: V[key].add(z) for key, z in Z.items()}
+        n_sp += next(iter(Z.values())).shape[0]
+        for rk, xk, yk in regs:
+            R[rk].add(Zc[xk], Zc[yk])
+        del Z, Zc
+
+    # ---- x 묶음마다: gamma 하나씩 풀고 gsel R^2 로 고른다 -> held R^2
+    groups: Dict[tuple, list] = {}
+    for rk, xk, yk in regs:
+        groups.setdefault(xk, []).append((rk, yk))
+    res = {}
+    for xk, members in groups.items():
+        vx = V[xk]
+        mu_x = vx.mean
+        Xg = cache["gsel"][xk].to(device) - mu_x
+        best = {rk: (None, None, -float("inf")) for rk, _ in members}
+        r2g = {rk: {} for rk, _ in members}
+        for c in gammas:
+            L = chol(vx, c)
+            for rk, yk in members:
+                B = torch.cholesky_solve(R[rk].cross(), L).float()
+                v = _r2(Xg, cache["gsel"][yk].to(device), V[yk].mean, B)
+                r2g[rk][str(c)] = v
+                if v > best[rk][2]:
+                    best[rk] = (B, c, v)
+                del B
+            del L
+        del Xg
+        Xh = cache["held"][xk].to(device) - mu_x
+        for rk, yk in members:
+            B, c, _ = best[rk]
+            res[rk] = {"B": B, "c": c, "r2_gsel": r2g[rk],
+                       "r2": _r2(Xh, cache["held"][yk].to(device), V[yk].mean, B)}
+            R[rk].Sxy = None
+        del Xh, best
+        vx.S2 = None
         torch.cuda.empty_cache()
-
-        # ---- gamma 고르기 (fit 과 겹치지 않는 train 질의)
-        Hg = {id(rg): Held(V[yk].d, device) for _, _, yk, rg in regs}
-        for bt in batches("gsel"):
-            Z = pooled(*bt)
-            for _, xk, yk, rg in regs:
-                Hg[id(rg)].add(Z[xk], Z[yk], V[xk].mean, V[yk].mean, maps[id(rg)])
-        pick = {}
-        for _, _, _, rg in regs:
-            r2g = Hg[id(rg)].r2()
-            c = max(r2g, key=lambda q: r2g[q])
-            pick[id(rg)] = (c, r2g)
-            maps[id(rg)] = {c: maps[id(rg)][c]}        # 나머지 gamma 는 버린다
-        del Hg
-        torch.cuda.empty_cache()
-
-        # ---- 판정 R^2 (sel)
-        Hh = {id(rg): Held(V[yk].d, device) for _, _, yk, rg in regs}
-        for bt in batches("held"):
-            Z = pooled(*bt)
-            for _, xk, yk, rg in regs:
-                Hh[id(rg)].add(Z[xk], Z[yk], V[xk].mean, V[yk].mean, maps[id(rg)])
-        res = {}
-        for key, xk, yk, rg in regs:
-            c, r2g = pick[id(rg)]
-            res[key] = {"B": maps[id(rg)][c], "c": c,
-                        "r2": Hh[id(rg)].r2().get(c, float("nan")),
-                        "r2_gsel": {str(q): v for q, v in r2g.items()}}
-        del Hh, V, regs, maps
-        log(f"    theta 층 {tls}  local 층 {len(lis)}개  회귀 {len(res)}  "
-            f"단어 {n_sp}  {time.time() - t0:.0f}s")
-        yield tls, res
-        del res
-        torch.cuda.empty_cache()
+    del cache, V, R
+    torch.cuda.empty_cache()
+    log(f"    theta 층 {tls}  local 층 {len(lis)}개  회귀 {len(res)}  단어 {n_sp}  "
+        f"{time.time() - t0:.0f}s  GPU 최대 {torch.cuda.max_memory_allocated() / 1e9:.1f}GB")
+    return res
