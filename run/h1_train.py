@@ -101,8 +101,10 @@ def train_one(name: str, a, device: str, log=print) -> dict:
         f"질의 {len(train)} (X 전체)")
 
     t0 = time.time()
+    torch.cuda.reset_peak_memory_stats()
     train_lord(ws, tok, cfg, NAME, train, cfg.seed,
                health=lambda: loss(ws.model, sel), log=log)
+    log(f"[{s}] 학습 중 GPU 최대 {torch.cuda.max_memory_allocated() / 1e9:.1f}GB")
 
     st = DeltaStore(ws, cfg, [NAME], log=lambda *_: None)
     vals = {}
