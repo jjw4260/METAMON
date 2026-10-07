@@ -2,6 +2,11 @@
 """이기종 1 단계. theta 와 이기종 Local 을 X 전체로 LoRD 학습한다.
 
     python run/h1_train.py --out /content/drive/MyDrive/metamon_runs/hetero
+    python run/h1_train.py --split disjoint --out .../hetero_disjoint --locals A B C
+
+disjoint 이면 X (train 4096) 를 한 번 무작위로 나눠 manifest 에 기록한다. theta 는
+X_theta (--theta-n) 로 LoRD 학습하고, Local k 는 서로 겹치지 않는 몫 X_k 로만 학습한다.
+theta 도 별도 프로세스에서 학습한다.
 
 Method 대로:
   - 각 theta_Local,k 는 **X 와 Y_Target 전체**로 학습한다 (조각 없음). 결과가 theta_Single,k.
@@ -38,6 +43,7 @@ from safetensors import safe_open
 from Pipeline.config import Config, load as load_cfg
 from Pipeline.data import load_dataset_file
 from Pipeline.deltastore import DeltaStore, st_path
+from Pipeline.hetero import split as SPL
 from Pipeline.hetero.space import HeteroSpace
 from Pipeline.lord import train_lord
 from Pipeline.metrics import EvalSet, loss
@@ -77,7 +83,7 @@ def theta_ok(path: str) -> str:
     return ""
 
 
-def train_one(name: str, a, device: str, log=print) -> dict:
+def train_one(name: str, a, device: str, log=print, idx=None) -> dict:
     s = short(name)
     cfg = Config(base=name, out_root=os.path.join(a.local_dir, s),
                  dataset_file=os.path.abspath(a.data), fleet_method="lord")
@@ -86,9 +92,9 @@ def train_one(name: str, a, device: str, log=print) -> dict:
     cfg.makedirs()
     tok = load_tokenizer(cfg)
     items = load_dataset_file(cfg.dataset_path, cfg, tok)
-    train = items[:cfg.n_train]
+    train = items[:cfg.n_train] if idx is None else SPL.pick(items, idx)
     sel_items = items[cfg.n_train:cfg.n_train + cfg.n_sel]
-    if len(train) < cfg.n_train or len(sel_items) < cfg.n_sel:
+    if len(items) < cfg.n_train + cfg.n_sel or not train:
         raise SystemExit(f"질의 부족: {len(items)}")
 
     ws = HeteroSpace(cfg, device)
@@ -98,7 +104,7 @@ def train_one(name: str, a, device: str, log=print) -> dict:
     ws.reset()
     base_L = loss(ws.model, sel)
     log(f"[{s}] base L(theta;1) = {base_L:.5f}   lord_lr {cfg.lord_lr}  "
-        f"질의 {len(train)} (X 전체)")
+        f"질의 {len(train)} ({'X 전체' if idx is None else '자기 몫'})")
 
     t0 = time.time()
     torch.cuda.reset_peak_memory_stats()
@@ -124,28 +130,40 @@ def train_one(name: str, a, device: str, log=print) -> dict:
     info = {"name": name, "arch": ws.arch.describe(), "L": ws.arch.L,
             "keys": "module", "delta": dst, "base_L": base_L,
             "L_at": {str(k): v for k, v in vals.items()}, "pass": ok,
-            "sec": time.time() - t0}
+            "n_train": len(train), "sec": time.time() - t0}
     del ws, sel
     torch.cuda.empty_cache()
     return info
 
 
 GATED = 3
+THETA = "__theta__"
 
 
 def child(a) -> None:
     """모델 하나를 학습하고 manifest 에 그 항목만 써 넣는다."""
     device = setup_precision()
+    mpath = os.path.join(a.out, "manifest.json")
+    man = json.load(open(mpath, encoding="utf-8"))
+    name = a.theta if a.only == THETA else a.only
+    n_x = Config().n_train
+    idx = None
+    if man.get("split"):
+        idx = (SPL.theta_idx(man, n_x) if a.only == THETA
+               else SPL.local_idx(man, name, n_x))
     try:
-        info = train_one(a.only, a, device)
+        info = train_one(name, a, device, idx=idx)
     except (SystemExit, Exception) as e:
         msg = str(e)
         if "게이트" in msg or "gated" in msg.lower() or "403 Client" in msg:
             sys.exit(GATED)
         raise
-    mpath = os.path.join(a.out, "manifest.json")
     man = json.load(open(mpath, encoding="utf-8"))
-    man["locals"][a.only] = info
+    if a.only == THETA:
+        info["keys"] = "role"
+        man["theta"] = info
+    else:
+        man["locals"][a.only] = info
     json.dump(man, open(mpath, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     del info
     gc.collect()
@@ -162,6 +180,9 @@ def main():
     ap.add_argument("--locals", nargs="*", default=DEFAULT_LOCALS)
     ap.add_argument("--lord-lr", type=float, default=None)
     ap.add_argument("--only", default=None, help="(내부용) 이 모델 하나만 학습한다")
+    ap.add_argument("--split", choices=["full", "disjoint"], default="full",
+                    help="disjoint: theta 는 X_theta 만, Local 은 서로 겹치지 않는 몫만 쓴다")
+    ap.add_argument("--theta-n", type=int, default=1024, help="disjoint 의 |X_theta|")
     a = ap.parse_args()
     if a.only:
         return child(a)
@@ -175,9 +196,38 @@ def main():
     def save():
         json.dump(man, open(mpath, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
+    def run_child(only):
+        cmd = [sys.executable, "-u", os.path.abspath(__file__), "--only", only,
+               "--theta", a.theta, "--data", a.data, "--out", a.out, "--local-dir", a.local_dir]
+        if a.lord_lr is not None:
+            cmd += ["--lord-lr", str(a.lord_lr)]
+        return subprocess.run(cmd).returncode
+
+    if a.split == "disjoint":
+        n_x = Config().n_train
+        if man.get("split"):
+            if sorted(man["split"]["locals"]) != sorted(a.locals) or \
+                    len(man["split"]["theta"]) != a.theta_n:
+                raise SystemExit(f"{mpath} 의 나누기와 지금 인자가 다르다: {SPL.describe(man)}. "
+                                 f"--out 을 바꿀 것.")
+        else:
+            man["split"] = SPL.make_split(n_x, a.theta_n, a.locals, Config().seed)
+            save()
+        print(f"[나누기] {SPL.describe(man)}")
+    elif man.get("split"):
+        raise SystemExit(f"{mpath} 는 disjoint 나누기다. --split disjoint 로 돌릴 것.")
+
     # ---- theta
     why = theta_ok(a.theta_delta)
-    if man.get("theta") and os.path.exists(man["theta"]["delta"]):
+    if a.split == "disjoint":
+        if man.get("theta") and os.path.exists(man["theta"]["delta"]):
+            print(f"[theta] 이미 있음: {man['theta']['delta']}")
+        else:
+            print(f"\n========== theta {a.theta} (X_theta 만) ==========", flush=True)
+            if run_child(THETA) != 0:
+                raise SystemExit("theta 학습 실패. 위 출력이 원인이다.")
+            man = json.load(open(mpath, encoding="utf-8"))
+    elif man.get("theta") and os.path.exists(man["theta"]["delta"]):
         print(f"[theta] 이미 있음: {man['theta']['delta']}")
     elif not why:
         c = load_cfg(os.path.join(os.path.dirname(a.theta_delta), "config.json"))
@@ -200,11 +250,7 @@ def main():
             print(f"\n[{s}] 이미 있음. 건너뜀")
             continue
         print(f"\n========== {name} ==========", flush=True)
-        cmd = [sys.executable, "-u", os.path.abspath(__file__), "--only", name,
-               "--data", a.data, "--out", a.out, "--local-dir", a.local_dir]
-        if a.lord_lr is not None:
-            cmd += ["--lord-lr", str(a.lord_lr)]
-        rc = subprocess.run(cmd).returncode
+        rc = run_child(name)
         if rc == GATED:
             print(f"*** {name}: 게이트된 저장소라 건너뛴다. "
                   f"https://huggingface.co/{name} 에서 라이선스에 동의한 뒤 다시 돌릴 것.")

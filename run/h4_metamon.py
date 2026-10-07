@@ -59,6 +59,7 @@ from Pipeline.config import Config
 from Pipeline.data import load_dataset_file
 from Pipeline.hetero.contrib import TailEval
 from Pipeline.hetero.load import load_tok
+from Pipeline.hetero import split as SPL
 from Pipeline.hetero.space import HeteroSpace
 from Pipeline.lord import mean_logp, token_logp
 from Pipeline.metrics import paired_bootstrap
@@ -129,7 +130,9 @@ def main():
     items = load_dataset_file(cfg.dataset_path, cfg, tok, log=lambda *_: None)
     c0 = a.n_x + a.n_sel
     t0_ = c0 + a.n_check
-    train, chk, test = items[:a.n_x], items[c0:t0_], items[t0_:t0_ + a.n_test]
+    train = SPL.pick(items, SPL.theta_idx(man, a.n_x))     # L(theta';1) 은 theta 의 질의만
+    chk, test = items[c0:t0_], items[t0_:t0_ + a.n_test]
+    print(f"[나누기] {SPL.describe(man)}   L(theta';1) 질의 {len(train)}")
     if len(test) < a.n_test:
         raise SystemExit(f"질의 부족: {len(items)}")
 
@@ -388,7 +391,8 @@ def main():
     md = ["# METAMON heterogeneous - final theta' (eq:metamon_loss)\n",
           f"- theta: {tinfo['name']} (+LoRD Δw); Locals: {', '.join(short(n) for n in names)}; plan {a.plan}",
           f"- recipe: {os.path.basename(a.recipe)} (omega {rec['omega']}, A {rec['alphas']}, chosen by {rec.get('chosen_by')})",
-          f"- L(theta';1) on X ({a.n_x}) with Y_Target; AdamW lr {lr}, batch {cfg.acc}, clip {cfg.grad_clip}, "
+          f"- {SPL.describe(man)}",
+          f"- L(theta';1) on theta's queries ({len(train)}) with Y_Target; AdamW lr {lr}, batch {cfg.acc}, clip {cfg.grad_clip}, "
           f"<= {epochs} epochs; checkpoint and lambda chosen by check L ({a.n_check}); reported on test ({a.n_test})",
           f"- lambda = r * L0/R0, L0 = {L0:.5f}, R0 = sum Conf ||z||^2 = {R0_main:.4e}\n",
           "| Setting | check L | test L | test ΔL vs theta [95% CI] | rel. | test avgBF | lambda (r) / stop |",

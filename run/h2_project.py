@@ -4,7 +4,9 @@
     python run/h2_project.py --manifest /content/drive/MyDrive/metamon_runs/hetero/manifest.json
 
 Local 마다 순서대로
-  1. eq:behavior_signature   s = || d mean_logp / d w ||_F^2   (X = train 4096, 각자의 tokenizer)
+  1. eq:behavior_signature   s = || d mean_logp / d w ||_F^2   (theta 가 가진 질의, 각자의 tokenizer)
+                             split full 이면 X 전체 4096, disjoint 이면 X_theta. theta' 의 소유자는
+                             Local 의 가중치만 받으므로 sensitivity 와 Mapping 은 자기 질의로 잰다.
   2. eq:sensitivity_profile  평균 제거 (ot.alignment_cost 안에서)
   3. eq:alignment_cost       역할 rho 마다 (L_theta x L_k)
   4. eq:ot_alignment         Pi_k 위의 OT. 세 계획을 모두 저장한다
@@ -45,6 +47,7 @@ from Pipeline.config import Config
 from Pipeline.data import load_dataset_file
 from Pipeline.hetero import ot as OT
 from Pipeline.hetero import sensitivity as SE
+from Pipeline.hetero import split as SPL
 from Pipeline.hetero.load import RoleDelta, load_tok, load_trained
 from Pipeline.hetero.mapping import solve_maps
 from Pipeline.hetero.roles import IN_KIND, ROLES, check_roles
@@ -212,7 +215,7 @@ def project_one(name, info, th, ttok, titems, Pt, a, device, log=print):
     check_sensitivity(lo, ltok, litems, device, log)
 
     # 1-4
-    Pk = get_profiles(s, lo, ltok, litems[:a.n_x], a, device, log)
+    Pk = get_profiles(s, lo, ltok, SPL.pick(litems, a.own_idx), a, device, log)
     pl = plans_for(Pt, Pk, a, log)
     np.savez(os.path.join(a.local_dir, f"plans_{s}.npz"),
              **{f"{r}.{k}": v for r in ROLES for k, v in pl[r]["plans"].items()},
@@ -232,8 +235,11 @@ def project_one(name, info, th, ttok, titems, Pt, a, device, log=print):
     # 5-7
     need_in = {(l, i, IN_KIND[r]) for r in ROLES for l, i, _ in pairs[r]}
     need_out = {(l, i, r) for r in ROLES for l, i, _ in pairs[r]}
-    fit = titems[:a.n_fit]
-    gsel = titems[a.n_fit:a.n_fit + a.n_gsel]
+    own = SPL.pick(titems, a.own_idx)          # theta 가 가진 질의 (X 또는 X_theta)
+    fit = own[:a.n_fit]
+    gsel = own[a.n_fit:a.n_fit + a.n_gsel]
+    if len(gsel) < a.n_gsel:
+        raise SystemExit(f"theta 의 질의 {len(own)} 가 fit {a.n_fit} + gsel {a.n_gsel} 보다 적다")
     held = titems[a.n_x:a.n_x + a.n_held]
     D = RoleDelta(lo, info["delta"], device)
     Z: Dict[str, torch.Tensor] = {}
@@ -362,11 +368,13 @@ def main():
     ttok, titems, tcfg = items_for(tinfo["name"], a.data)
     if len(titems) < a.n_x + a.n_held:
         raise SystemExit(f"질의 부족: {len(titems)}")
+    a.own_idx = SPL.theta_idx(man, a.n_x)
+    print(f"[나누기] {SPL.describe(man)}   sensitivity·Mapping 질의 = theta 의 몫 {len(a.own_idx)}")
     th, n = load_trained(tinfo["name"], tinfo["delta"], device)
     print(f"[theta] {th.describe()}  Δw 모듈 {n}개 더함")
     roles_check(th, ttok, titems, device)
     check_sensitivity(th, ttok, titems, device)
-    Pt = get_profiles("theta", th, ttok, titems[:a.n_x], a, device)
+    Pt = get_profiles("theta", th, ttok, SPL.pick(titems, a.own_idx), a, device)
 
     names = a.locals or list(man["locals"].keys())
     out = {}
