@@ -25,7 +25,14 @@ lambda 격자
   theta, theta + z (조립), theta' (lambda 별), LOO theta'_-k 의 check / test L,
   theta 대비 paired bootstrap 95% CI, avgBF, 그리고 eq:dependency_mitigation 용
   Var_k(avgBF) (theta_Single,k 대 LOO).
-고른 theta' 의 Δw (= w - Llama BASE, fp16, 키 "{i}.{rho}") 를 Drive 에 저장한다.
+고른 theta' 의 Δw (= w - Llama BASE, fp16, 키 "{i}.{rho}") 를 Drive 에 저장한다
+(theta_prime.safetensors, 어느 arm 인지는 theta_prime.json). lambda=0 arm 도
+theta_prime_wo.safetensors 로 저장한다 (생성 평가의 w/o Weight Loss 행).
+
+anchor 대조 (고른 lambda, 같은 Confidence)
+  ctl_zero   anchor = theta (z = 0). 정규화가 theta 근처에 붙잡는 효과만 남는다.
+  ctl_rand   anchor = theta + 같은 칸·Scale·norm 의 무작위 방향.
+  METAMON 과의 질의별 차이를 paired bootstrap 으로 낸다.
 --save-loo 면 LOO 도 저장한다 (하나에 약 6GB).
 
 arm 하나가 끝날 때마다 결과를 Drive 에 쓴다. 끊기면 같은 명령으로 이어 간다.
@@ -85,7 +92,9 @@ def main():
     ap.add_argument("--recipe", default=None, help="기본: h3/<plan>/select_check.json")
     ap.add_argument("--out", default=None, help="기본: manifest 옆 h4/<plan>")
     ap.add_argument("--local-dir", default="/content/hetero_local/h4")
-    ap.add_argument("--lam-rel", type=float, nargs="*", default=[0.0, 0.01, 0.1, 1.0, 10.0])
+    ap.add_argument("--lam-rel", type=float, nargs="*",
+                    default=[0.0, 0.01, 0.1, 1.0, 10.0, 30.0, 100.0])
+    ap.add_argument("--skip-controls", action="store_true")
     ap.add_argument("--lr", type=float, default=None, help="기본: cfg.sft_lr")
     ap.add_argument("--epochs", type=int, default=None, help="기본: cfg.sft_epochs")
     ap.add_argument("--eval-every", type=int, default=64, help="update 단위")
@@ -135,9 +144,14 @@ def main():
     def to_theta():
         ws.apply(lambda k: lf.get_tensor(f"{k[0]}.{k[1]}"))
 
-    def anchor(recipe):
-        """w_theta + z (eq:norm_matching 로 h3 와 같은 z), 그리고 sum Confidence ||z||^2."""
+    def anchor(recipe, mode="z"):
+        """w_theta + z (eq:norm_matching 로 h3 와 같은 z), 그리고 sum Confidence ||z||^2.
+
+        mode = "zero"    대조: z = 0. anchor 가 theta 자신 (같은 lambda, Confidence)
+               "random"  대조: 같은 칸·같은 Scale·같은 norm 의 가우시안 방향
+        """
         to_theta()
+        g = torch.Generator(device=device).manual_seed(4242) if mode == "random" else None
         A, R0 = {}, 0.0
         cells = {(c["l"], c["role"]): c for c in recipe["cells"]}
         conf = recipe["confidence"]
@@ -146,9 +160,12 @@ def main():
                 W = ws.lin[k].weight
                 A[k] = W.detach().clone()
                 c = cells.get(k)
-                if c is None:
+                if c is None or mode == "zero":
                     continue
-                d = zf[c["k"]].get_tensor(f"{k[0]}.{k[1]}").to(device).float()
+                if mode == "random":
+                    d = torch.randn(W.shape, generator=g, device=device, dtype=torch.float32)
+                else:
+                    d = zf[c["k"]].get_tensor(f"{k[0]}.{k[1]}").to(device).float()
                 d.mul_(c["a"] * float(W.norm()) / max(float(d.norm()), 1e-30))
                 A[k].add_(d)
                 R0 += conf[k[0]] * float((d * d).sum())
@@ -189,17 +206,20 @@ def main():
           f"lr {lr}  epochs {epochs}  배치 {cfg.acc}  clip {cfg.grad_clip}")
 
     # ---- arm 하나
-    def train_arm(tag, lam, recipe, save_to=None):
+    def train_arm(tag, lam, recipe, save_to=None, mode="z"):
         path = os.path.join("arms", f"{tag}.json")
         if os.path.exists(os.path.join(a.out, path)):
             r = json.load(open(os.path.join(a.out, path), encoding="utf-8"))
-            if save_to is None or os.path.exists(save_to):
+            if abs(r["lambda"] - lam) > 1e-9 * max(1.0, abs(lam)):
+                print(f"\n[{tag}] 저장된 결과의 lambda {r['lambda']:.4e} 가 지금 {lam:.4e} 와 달라 다시 학습한다")
+            elif save_to is None or os.path.exists(save_to):
                 print(f"\n[{tag}] 이미 있음 (check {r['check_L']:.5f}  test {r['test_L']:.5f})")
                 return r
-            print(f"\n[{tag}] 결과는 있으나 Δw 저장본이 없어 다시 학습한다")
-        print(f"\n========== {tag}  lambda {lam:.4e} ==========", flush=True)
+            else:
+                print(f"\n[{tag}] 결과는 있으나 Δw 저장본이 없어 다시 학습한다")
+        print(f"\n========== {tag}  lambda {lam:.4e}  anchor {mode} ==========", flush=True)
         t_start = time.time()
-        A, R0 = anchor(recipe) if lam > 0 else (None, 0.0)
+        A, R0 = anchor(recipe, mode) if lam > 0 else (None, 0.0)
         to_theta()
         conf = recipe["confidence"]
 
@@ -278,7 +298,7 @@ def main():
                 ws.lin[k].weight.copy_(buf[k].to(device))
         lpc, lpt = ev_c.mlp(), ev_t.mlp()
         dist = reg()
-        out = {"tag": tag, "lambda": lam, "lam_rel": lam / lam_u if lam_u else 0.0,
+        out = {"tag": tag, "lambda": lam, "lam_rel": lam / lam_u if lam_u else 0.0, "anchor": mode,
                "best_update": best["upd"], "updates_run": upd,
                "check_L": -float(lpc.mean()), "test_L": -float(lpt.mean()),
                "reg_final": dist, "reg_start": R0,
@@ -304,14 +324,26 @@ def main():
 
     # ---- lambda 격자
     arms = {}
+    wo_path = os.path.join(a.out, "theta_prime_wo.safetensors")
     for r in a.lam_rel:
         tag = f"lam_{r:g}"
-        arms[tag] = train_arm(tag, r * lam_u, rec["main"])
+        arms[tag] = train_arm(tag, r * lam_u, rec["main"], save_to=wo_path if r == 0 else None)
     best_tag = min(arms, key=lambda t: arms[t]["check_L"])
     lam_star = arms[best_tag]["lambda"]
+    r_star = lam_star / lam_u
     print(f"\n[선택] check L 최소: {best_tag}  lambda {lam_star:.4e}  check {arms[best_tag]['check_L']:.5f}")
+    if best_tag == f"lam_{max(a.lam_rel):g}":
+        print("  *** 고른 lambda 가 격자의 끝이다. --lam-rel 에 더 큰 값을 넣어 확인할 것.")
+
+    # theta_prime.safetensors 가 어느 arm 인지 기록한다. 고른 arm 이 바뀌면 덮어쓴다.
     main_path = os.path.join(a.out, "theta_prime.safetensors")
-    if not os.path.exists(main_path):
+    tp_json = os.path.join(a.out, "theta_prime.json")
+    saved_tag = None
+    if os.path.exists(tp_json):
+        saved_tag = json.load(open(tp_json, encoding="utf-8"))["tag"]
+    elif os.path.exists(main_path) and os.path.exists(os.path.join(a.out, "report_h4.json")):
+        saved_tag = json.load(open(os.path.join(a.out, "report_h4.json"), encoding="utf-8"))["chosen"]
+    if not (os.path.exists(main_path) and saved_tag == best_tag):
         lt = arms[best_tag].get("delta_local")
         if lt and os.path.exists(lt):
             copy_verified(lt, main_path)
@@ -321,6 +353,13 @@ def main():
             arms[best_tag] = train_arm(best_tag, lam_star, rec["main"], save_to=main_path)
     arms[best_tag]["delta"] = main_path
     save_json(a, os.path.join("arms", f"{best_tag}.json"), arms[best_tag])
+    save_json(a, "theta_prime.json", {"tag": best_tag, "lambda": lam_star})
+
+    # ---- anchor 대조 (같은 lambda, 같은 Confidence)
+    ctl = {}
+    if not a.skip_controls:
+        ctl["zero"] = train_arm(f"ctl_zero_r{r_star:g}", lam_star, rec["main"], mode="zero")
+        ctl["random"] = train_arm(f"ctl_rand_r{r_star:g}", lam_star, rec["main"], mode="random")
 
     # ---- LOO
     loo = {}
@@ -362,9 +401,29 @@ def main():
             lab = f"**{lab} (chosen)**"
         md.append(row(lab, r_["check_L"], r_["test_lp"],
                       f"{r_['lambda']:.3e} ({r_['lam_rel']:g}) / u{r_['best_update']}"))
+    lab_ctl = {"zero": "anchor = theta (z = 0)", "random": "anchor = theta + random direction"}
+    for mname, r_ in ctl.items():
+        md.append(row(f"  control: {lab_ctl[mname]}", r_["check_L"], r_["test_lp"],
+                      f"{r_['lambda']:.3e} / u{r_['best_update']}"))
     for n, r_ in loo.items():
         md.append(row(f"theta'_-{short(n)} (LOO)", r_["check_L"], r_["test_lp"],
                       f"{r_['lambda']:.3e} / u{r_['best_update']}"))
+
+    # METAMON (고른 arm) 과 대조군의 질의별 차이 (test)
+    ch = np.asarray(arms[best_tag]["test_lp"])
+    comp = [("w/o Weight Loss (lambda=0)", arms.get("lam_0", {}).get("test_lp")),
+            ("anchor = theta (z = 0)", ctl.get("zero", {}).get("test_lp")),
+            ("anchor = theta + random direction", ctl.get("random", {}).get("test_lp")),
+            ("theta + z (no training)", lp_asm["test"])]
+    md += ["", "| METAMON theta' minus | test ΔL [95% CI] | verdict |", "|---|---|---|"]
+    pairs_out = {}
+    for lab, other in comp:
+        if other is None:
+            continue
+        m, lo_, hi_ = paired_bootstrap(-ch, -np.asarray(other))
+        v = "better" if hi_ < 0 else ("worse" if lo_ > 0 else "n.s.")
+        md.append(f"| {lab} | {m:+.5f} [{lo_:+.5f}, {hi_:+.5f}] | {v} |")
+        pairs_out[lab] = [m, lo_, hi_]
 
     # eq:dependency_mitigation
     h3r = os.path.join(root, "h3", a.plan, "report.json")
@@ -388,7 +447,7 @@ def main():
         "chosen": best_tag, "lambda_star": lam_star,
         "theta": {k: np.asarray(v).tolist() for k, v in lp_theta.items()},
         "assembly": {k: np.asarray(v).tolist() for k, v in lp_asm.items()},
-        "arms": arms, "loo": loo})
+        "arms": arms, "loo": loo, "controls": ctl, "paired_vs_chosen": pairs_out})
     print(f"저장: {a.out}/report_h4.md  report_h4.json  theta_prime.safetensors")
 
 
