@@ -48,6 +48,9 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=None,
                     help="새로 보낼 질의 상한. 캐시 적중은 세지 않는다")
     ap.add_argument("--subset", default="cs-en")
+    ap.add_argument("--pool", type=int, default=None,
+                    help="훑을 WMT train 문장 수. 프롬프트 길이 필터 (max_prompt_tok) 를 넘는 문장이 "
+                         "많은 언어쌍 (ru, fi 등) 은 기본 8192 로는 4992 질의가 안 모인다")
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
 
@@ -60,6 +63,8 @@ def main() -> None:
                  target_base_url=a.base_url)
     if a.model:
         cfg.target_model = a.model
+    if a.pool is not None:
+        cfg.pool = a.pool
     if a.budget is not None:
         cfg.query_budget = a.budget
     cfg.makedirs()
