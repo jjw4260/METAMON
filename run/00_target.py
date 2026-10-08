@@ -51,7 +51,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
 
+    src_key, tgt_key = a.subset.split("-")          # "ru-en" -> ru, en (WMT16 translation 키)
     cfg = Config(out_root=a.out, subset=a.subset, seed=a.seed,
+                 src_key=src_key, tgt_key=tgt_key,
                  target_provider=a.provider,
                  target_temperature=a.temperature,
                  target_max_tokens=a.max_tokens,
