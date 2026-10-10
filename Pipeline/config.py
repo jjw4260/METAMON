@@ -44,6 +44,9 @@ class Config:
     filter_tokenizer: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
     max_prompt_tok: int = 96       # filter_tokenizer 기준 프롬프트 상한
     max_tok: int = 160             # 프롬프트 + Target 응답 상한
+    # 프롬프트가 max_tok 에 가까워 응답 자리가 이보다 작으면 이만큼은 보장한다
+    # (그 질의만 max_tok 을 넘는다). 이전에는 자리가 0 이하이면 멈췄다.
+    min_resp_tok: int = 32
     # Target 응답(gid) 끝에 EOS 를 붙인다. 붙이지 않으면 LoRD 가 끝맺음을
     # 지운다: y_vic 에는 EOS 가 없고 모델 표본 y- 는 첫 EOS 까지 잘라 쓰므로,
     # log P(y-) 를 끌어내리는 항이 EOS 확률만 한쪽으로 깎는다. 3B 런에서

@@ -86,7 +86,7 @@ def build_queries(cfg: Config, tok=None) -> List[Item]:
 def attach(items: Sequence[Item], responses: Sequence[str], cfg: Config, tok,
            log=print) -> List[Item]:
     """Target 응답을 gold 로 붙이고 토크나이즈한다."""
-    out, cut, empty = [], 0, 0
+    out, cut, empty, longp = [], 0, 0, 0
     for it, resp in zip(items, responses):
         g = " " + resp.strip()
         gid = tok(g, add_special_tokens=False)["input_ids"]
@@ -95,8 +95,12 @@ def attach(items: Sequence[Item], responses: Sequence[str], cfg: Config, tok,
         it = dict(it)
         it["pid"] = tok(it["prompt"], add_special_tokens=True)["input_ids"]
         room = cfg.max_tok - len(it["pid"])
-        if room < 1:
-            raise SystemExit("max_tok 이 프롬프트보다 짧다. 설정을 확인할 것.")
+        # 질의 필터는 TinyLlama 토큰으로 건다. 다른 tokenizer (예: SmolLM2 로 러시아어) 는
+        # 같은 프롬프트가 max_tok 을 넘을 수 있다. 질의를 버리거나 프롬프트를 자르면
+        # Local 마다 질의 집합이 달라지므로, 응답 자리만 min_resp_tok 까지 보장한다.
+        if room < cfg.min_resp_tok:
+            room = cfg.min_resp_tok
+            longp += 1
         # EOS 를 붙일 자리를 먼저 뺀다. 응답이 잘렸어도 끝맺음은 배워야 한다.
         keep = room - 1 if cfg.gold_eos else room
         if len(gid) > keep:
@@ -109,7 +113,8 @@ def attach(items: Sequence[Item], responses: Sequence[str], cfg: Config, tok,
         d = dict(it)
         d.update({"gold": g, "gid": gid, "ntok": len(gid)})
         out.append(d)
-    log(f"[응답] {len(out)}개 부착.  길이 초과로 자름 {cut}  빈 응답 {empty}")
+    log(f"[응답] {len(out)}개 부착.  길이 초과로 자름 {cut}  빈 응답 {empty}"
+        + (f"  긴 프롬프트 {longp} (응답 자리 {cfg.min_resp_tok} 보장)" if longp else ""))
     return out
 
 
