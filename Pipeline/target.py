@@ -179,6 +179,15 @@ class OpenAITarget(TargetModel):
                 return (res.choices[0].message.content or "").strip()
             except Exception as e:          # rate limit, 일시 오류
                 last = e
+                msg = str(e)
+                # 재시도해도 소용없는 오류는 바로 멈춘다 (크레딧 소진, 키 오류, 모델 없음).
+                if any(k in msg for k in ("insufficient_quota", "credit_balance_exhausted",
+                                          "invalid_api_key", "model_not_found")) \
+                        or getattr(e, "status_code", None) in (401, 403, 404):
+                    raise SystemExit(
+                        "API 가 재시도로 해결되지 않는 오류를 냈다. 받은 응답은 cache.jsonl 에 "
+                        "남아 있으니 원인을 해결한 뒤 같은 명령을 다시 실행하면 이어서 진행한다.\n"
+                        f"  {msg[:300]}")
                 time.sleep(self.backoff ** a)
         raise SystemExit(f"API 호출이 {self.retries} 번 실패했다: {last}")
 
