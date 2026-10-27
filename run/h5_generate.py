@@ -153,7 +153,7 @@ def main():
 
     md = ["# METAMON heterogeneous - generation metrics\n",
           f"- test items {t0_}..{t0_ + len(pool) - 1} ({len(pool)}), greedy, max_new_tokens {cfg.gen_max_new}",
-          "- vs ref = dataset reference (E1, LoRD Table 1 axis); vs Target = Target (gpt-3.5) response (E1-b); "
+          f"- task {cfg.task or 'wmt'}; vs ref = dataset reference (E1, LoRD Table 1 axis); vs Target = Target response (E1-b); "
           "F = ROUGE-L(arm, ref) / ROUGE-L(Target, ref)\n",
           "## E1 - vs ref\n",
           "| Method | BLEU-4 | ROUGE-L | BERTScore-F1 | Fidelity F |", "|---|---|---|---|---|",
@@ -186,6 +186,31 @@ def main():
            f"  - Target: {gold[0]!r}"]
     for lab in labels:
         md.append(f"  - {lab}: {hyps[lab][0]!r}")
+    # ---- 과제별 지표 (QA: 정답 선택, Safety: 독성)
+    from Pipeline import tasks as TK
+    metric = "text" if TK.is_wmt(cfg.task) else TK.TASKS[cfg.task]["metric"]
+    task_scores = {}
+    if metric == "choice" and all("label" in x for x in pool):
+        ys = [int(x["label"]) for x in pool]
+        rows_ = [("Target Model", gold)] + [(lab, hyps[lab]) for lab in labels]
+        md += ["", f"## {cfg.task} - choice accuracy (test {len(pool)})\n",
+               "| Method | Accuracy | Precision | Recall | F1 | unparsed |", "|---|---|---|---|---|---|"]
+        for lab, hs in rows_:
+            sc = TK.choice_scores([TK.parse_choice(h) for h in hs], ys)
+            task_scores[lab] = sc
+            md.append(f"| {lab} | {sc['Accuracy']:.4f} | {sc['Precision']:.4f} | {sc['Recall']:.4f} | "
+                      f"{sc['F1']:.4f} | {sc['unparsed']:.1%} |")
+    elif metric == "safety":
+        rows_ = [("Target Model", gold)] + [(lab, hyps[lab]) for lab in labels]
+        md += ["", f"## {cfg.task} - toxicity x100 (unitary/toxic-bert, lower is better; test {len(pool)})\n",
+               "| Method | " + " | ".join(k for k, _ in TK.TOX_LABELS) + " |",
+               "|---|" + "---|" * len(TK.TOX_LABELS)]
+        for lab, hs in rows_:
+            sc = TK.toxicity(hs, device)
+            task_scores[lab] = sc
+            md.append(f"| {lab} | " + " | ".join(f"{sc[k]:.2f}" for k, _ in TK.TOX_LABELS) + " |")
+    if task_scores:
+        save_json(a, "report_task.json", {"task": cfg.task, "metric": metric, "scores": task_scores})
     md_text = "\n".join(md) + "\n"
     print("\n" + md_text)
     tmp = os.path.join(a.local_dir, "report_gen.md")

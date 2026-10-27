@@ -322,29 +322,45 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
             broke = False
             for s in range(0, len(order) - cfg.acc + 1, cfg.acc):
                 sl = order[s:s + cfg.acc]
-                bp = [pids[j] for j in sl]
-                lp_p2, m_p2 = token_logp(ws.model, bp, [pos_c[j] for j in sl],
-                                         pad, ws.device)
-                lp_n2, m_n2 = token_logp(ws.model, bp, [neg_c[j] for j in sl],
-                                         pad, ws.device)
-                # y_vic. Eq.10 의 L_reg 는 Target 응답을 기준점으로 쓴다.
-                lp_v2, m_v2 = token_logp(ws.model, bp,
-                                         [chunk[j]["gid"] for j in sl],
-                                         pad, ws.device)
-                L, st = lord_loss(lp_p2, m_p2, lp_n2, m_n2, lp_v2, m_v2, cfg)
-                Lm = L.mean()
+                # 긴 입력 (요약 등) 은 질의 몇 개씩 나눠 역전파하고 한 번에 step 한다.
+                # 손실이 질의별 항의 평균이라 결과는 한 번에 계산한 것과 같다.
+                mb = cfg.lord_micro or cfg.acc
+                opt.zero_grad(set_to_none=True)
+                Ls, pps, pns, pvs, sts = [], [], [], [], []
+                for c0 in range(0, len(sl), mb):
+                    cs = sl[c0:c0 + mb]
+                    bp = [pids[j] for j in cs]
+                    lp_p2, m_p2 = token_logp(ws.model, bp, [pos_c[j] for j in cs],
+                                             pad, ws.device)
+                    lp_n2, m_n2 = token_logp(ws.model, bp, [neg_c[j] for j in cs],
+                                             pad, ws.device)
+                    # y_vic. Eq.10 의 L_reg 는 Target 응답을 기준점으로 쓴다.
+                    lp_v2, m_v2 = token_logp(ws.model, bp,
+                                             [chunk[j]["gid"] for j in cs],
+                                             pad, ws.device)
+                    L, st_c = lord_loss(lp_p2, m_p2, lp_n2, m_n2, lp_v2, m_v2, cfg)
+                    (L.sum() / len(sl)).backward()
+                    with torch.no_grad():
+                        Ls.append(L.detach())
+                        pps.append(norm_prob(lp_p2.detach(), m_p2))
+                        pns.append(norm_prob(lp_n2.detach(), m_n2))
+                        pvs.append(norm_prob(lp_v2.detach(), m_v2))
+                    sts.append((st_c, len(cs)))
+                    del lp_p2, lp_n2, lp_v2, L
+                Lm = torch.cat(Ls).mean()
                 if not torch.isfinite(Lm):
                     raise SystemExit(f"{name}: 비정상 손실 {float(Lm)}")
-                opt.zero_grad(set_to_none=True)
-                Lm.backward()
+                st = sts[-1][0]
+                for fld in ("obj", "reg", "clip_sat"):
+                    setattr(st, fld, sum(getattr(x, fld) * w for x, w in sts) / len(sl))
                 gn = float(clip_grad_norm_(ws.params, cfg.grad_clip))
                 opt.step()
                 upd += 1
 
                 with torch.no_grad():
-                    cp = float(norm_prob(lp_p2.detach(), m_p2).median())
-                    cn = float(norm_prob(lp_n2.detach(), m_n2).median())
-                    cv = float(norm_prob(lp_v2.detach(), m_v2).median())
+                    cp = float(torch.cat(pps).median())
+                    cn = float(torch.cat(pns).median())
+                    cv = float(torch.cat(pvs).median())
                 jl.write(json.dumps({"period": t, "update": upd,
                                      "loss": float(Lm.detach()), "gnorm": gn,
                                      "p_pos": cp, "p_neg": cn, "p_vic": cv,

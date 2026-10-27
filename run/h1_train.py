@@ -89,6 +89,8 @@ def train_one(name: str, a, device: str, log=print, idx=None) -> dict:
                  dataset_file=os.path.abspath(a.data), fleet_method="lord")
     if a.lord_lr is not None:
         cfg.lord_lr = a.lord_lr
+    if a.lord_micro:
+        cfg.lord_micro = a.lord_micro
     cfg.makedirs()
     tok = load_tokenizer(cfg)
     items = load_dataset_file(cfg.dataset_path, cfg, tok)
@@ -179,6 +181,8 @@ def main():
                     help="같은 설정으로 X 전체에 학습한 theta 의 Δw. 없으면 여기서 학습")
     ap.add_argument("--locals", nargs="*", default=DEFAULT_LOCALS)
     ap.add_argument("--lord-lr", type=float, default=None)
+    ap.add_argument("--lord-micro", type=int, default=0,
+                    help="LoRD 역전파 묶음 크기 (긴 입력 과제에서 GPU 메모리를 줄인다)")
     ap.add_argument("--only", default=None, help="(내부용) 이 모델 하나만 학습한다")
     ap.add_argument("--split", choices=["full", "disjoint"], default="full",
                     help="disjoint: theta 는 X_theta 만, Local 은 서로 겹치지 않는 몫만 쓴다")
@@ -201,6 +205,8 @@ def main():
                "--theta", a.theta, "--data", a.data, "--out", a.out, "--local-dir", a.local_dir]
         if a.lord_lr is not None:
             cmd += ["--lord-lr", str(a.lord_lr)]
+        if a.lord_micro:
+            cmd += ["--lord-micro", str(a.lord_micro)]
         return subprocess.run(cmd).returncode
 
     if a.split == "disjoint":

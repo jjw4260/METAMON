@@ -28,6 +28,8 @@ class Config:
     base: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
     dataset: str = "wmt/wmt16"
     subset: str = "cs-en"
+    # 비어 있으면 WMT16 번역 (subset). 그 밖은 Pipeline/tasks.py 의 TASKS 키
+    task: str = ""
     src_key: str = "cs"
     tgt_key: str = "en"
     # 빈 문자열이면 target.TASK_PROMPT[subset] 을 쓴다 (LoRD-MEA 와 동일)
@@ -170,6 +172,7 @@ class Config:
 
     # ---------------- 공통 학습 ----------------
     acc: int = 8                   # 실효 배치
+    lord_micro: int = 0            # LoRD 역전파 묶음 (0 = acc). 긴 입력에서 메모리를 줄인다
     grad_clip: float = 1.0
 
     # ---------------- 생성 ----------------

@@ -48,6 +48,8 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=None,
                     help="새로 보낼 질의 상한. 캐시 적중은 세지 않는다")
     ap.add_argument("--subset", default="cs-en")
+    ap.add_argument("--task", default="",
+                    help="비우면 WMT16 번역 (--subset). e2e_nlg / wikisql / samsum / piqa / saferlhf")
     ap.add_argument("--pool", type=int, default=None,
                     help="훑을 WMT train 문장 수. 프롬프트 길이 필터 (max_prompt_tok) 를 넘는 문장이 "
                          "많은 언어쌍 (ru, fi 등) 은 기본 8192 로는 4992 질의가 안 모인다")
@@ -65,6 +67,9 @@ def main() -> None:
         cfg.target_model = a.model
     if a.pool is not None:
         cfg.pool = a.pool
+    from Pipeline import tasks as TK
+    cfg.task = a.task
+    TK.apply_task(cfg, a.task)
     if a.budget is not None:
         cfg.query_budget = a.budget
     cfg.makedirs()
@@ -102,7 +107,9 @@ def main() -> None:
             "queries_sent": target.sent, "cache_hits": target.cached,
             "query_hash": sp.query_hash(), "shard_hash": sp.shard_hash(),
             "temperature": cfg.target_temperature,
-            "max_tokens": cfg.target_max_tokens}
+            "max_tokens": cfg.target_max_tokens,
+            "task_cfg": TK.task_meta(cfg, a.task),
+            "task_source": getattr(cfg, "task_source", "wmt/wmt16")}
     save_dataset(cfg.dataset_path, full, meta)
 
     print(f"\n[회계] 신규 질의 {target.sent}   캐시 적중 {target.cached}")

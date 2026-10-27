@@ -58,22 +58,30 @@ def build_queries(cfg: Config, tok=None) -> List[Item]:
 
     `tok` 인자는 받지만 쓰지 않는다. 필터는 언제나 cfg.filter_tokenizer 다.
     """
-    ds = load_dataset(cfg.dataset, cfg.subset, split="train")
-    n = min(cfg.pool, len(ds))
-    rows = [ds[i]["translation"] for i in range(n)]
-
-    srcs = [r[cfg.src_key] for r in rows]
-    refs = [r[cfg.tgt_key] for r in rows]
+    from . import tasks as TK
+    if TK.is_wmt(cfg.task):
+        ds = load_dataset(cfg.dataset, cfg.subset, split="train")
+        n = min(cfg.pool, len(ds))
+        rows = [ds[i]["translation"] for i in range(n)]
+        srcs = [r[cfg.src_key] for r in rows]
+        refs = [r[cfg.tgt_key] for r in rows]
+        extras = [{} for _ in rows]
+    else:
+        trip, used = TK.rows(cfg.task, cfg.pool)
+        cfg.task_source = used
+        srcs = [t[0] for t in trip]
+        refs = [t[1] for t in trip]
+        extras = [t[2] for t in trip]
     prompts = [local_prompt(cfg, s) for s in srcs]
     ftok = filter_tokenizer(cfg)
     enc = ftok(prompts, add_special_tokens=True)["input_ids"]
 
     seen, items = set(), []
-    for s, r, p, ip in zip(srcs, refs, prompts, enc):
+    for s, r, p, ip, ex in zip(srcs, refs, prompts, enc, extras):
         if p in seen or len(ip) > cfg.max_prompt_tok:
             continue
         seen.add(p)
-        items.append({"src": s, "ref": r, "prompt": p, "pid": ip})
+        items.append({"src": s, "ref": r, "prompt": p, "pid": ip, **ex})
 
     order = np.random.RandomState(cfg.seed).permutation(len(items))
     items = [items[i] for i in order]
@@ -124,17 +132,29 @@ def save_dataset(path: str, items: Sequence[Item], meta: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"meta": meta,
                    "items": [{"src": x["src"], "ref": x["ref"],
-                              "prompt": x["prompt"], "gold": x["gold"]}
+                              "prompt": x["prompt"], "gold": x["gold"],
+                              **({"label": x["label"]} if "label" in x else {})}
                              for x in items]}, f, ensure_ascii=False)
     os.replace(tmp, path)
 
 
 def load_dataset_file(path: str, cfg: Config, tok, log=print) -> List[Item]:
     raw = json.load(open(path, encoding="utf-8"))
+    # 과제의 길이 설정은 dataset.json 이 정한다 (모든 단계가 같은 max_tok 을 쓰게)
+    tm = (raw.get("meta") or {}).get("task_cfg")
+    if tm:
+        cfg.task = tm["task"]
+        cfg.instruction = tm["instruction"]
+        cfg.max_prompt_tok = tm["max_prompt_tok"]
+        cfg.max_tok = tm["max_tok"]
+        cfg.gen_max_new = tm["gen_max_new"]
     items = []
     for x in raw["items"]:
-        items.append({"src": x["src"], "ref": x["ref"], "prompt": x["prompt"],
-                      "pid": tok(x["prompt"], add_special_tokens=True)["input_ids"]})
+        d = {"src": x["src"], "ref": x["ref"], "prompt": x["prompt"],
+             "pid": tok(x["prompt"], add_special_tokens=True)["input_ids"]}
+        if "label" in x:
+            d["label"] = x["label"]
+        items.append(d)
     return attach(items, [x["gold"] for x in raw["items"]], cfg, tok, log)
 
 
