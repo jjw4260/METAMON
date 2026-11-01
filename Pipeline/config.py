@@ -173,6 +173,7 @@ class Config:
     # ---------------- 공통 학습 ----------------
     acc: int = 8                   # 실효 배치
     lord_micro: int = 0            # LoRD 역전파 묶음 (0 = acc). 긴 입력에서 메모리를 줄인다
+    optim: str = "adamw"           # "adamw" | "adamw8bit" | "paged_adamw8bit" (7B 이상 단일 모델용, bitsandbytes)
     grad_clip: float = 1.0
 
     # ---------------- 생성 ----------------

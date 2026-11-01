@@ -91,6 +91,7 @@ def train_one(name: str, a, device: str, log=print, idx=None) -> dict:
         cfg.lord_lr = a.lord_lr
     if a.lord_micro:
         cfg.lord_micro = a.lord_micro
+    cfg.optim = getattr(a, "optim", "adamw")
     cfg.makedirs()
     tok = load_tokenizer(cfg)
     items = load_dataset_file(cfg.dataset_path, cfg, tok)
@@ -183,6 +184,7 @@ def main():
     ap.add_argument("--lord-lr", type=float, default=None)
     ap.add_argument("--lord-micro", type=int, default=0,
                     help="LoRD 역전파 묶음 크기 (긴 입력 과제에서 GPU 메모리를 줄인다)")
+    ap.add_argument("--optim", default="adamw", choices=["adamw", "adamw8bit", "paged_adamw8bit"])
     ap.add_argument("--only", default=None, help="(내부용) 이 모델 하나만 학습한다")
     ap.add_argument("--split", choices=["full", "disjoint"], default="full",
                     help="disjoint: theta 는 X_theta 만, Local 은 서로 겹치지 않는 몫만 쓴다")
@@ -207,6 +209,8 @@ def main():
             cmd += ["--lord-lr", str(a.lord_lr)]
         if a.lord_micro:
             cmd += ["--lord-micro", str(a.lord_micro)]
+        if a.optim != "adamw":
+            cmd += ["--optim", a.optim]
         return subprocess.run(cmd).returncode
 
     if a.split == "disjoint":

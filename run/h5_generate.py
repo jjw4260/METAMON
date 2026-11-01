@@ -71,6 +71,9 @@ def main():
     ap.add_argument("--n-sel", type=int, default=128)
     ap.add_argument("--n-check", type=int, default=256)
     ap.add_argument("--text-n", type=int, default=256)
+    ap.add_argument("--extra", action="append", default=[],
+                    help="LABEL=PATH. theta 구조의 Δw (h4 의 theta_prime.safetensors) 를 arm 으로 더한다. 여러 번")
+    ap.add_argument("--only-extra", action="store_true", help="기본 arm 없이 --extra 만 생성한다")
     a = ap.parse_args()
     root = os.path.dirname(a.manifest)
     a.out = a.out or os.path.join(root, "h5", a.plan)
@@ -100,6 +103,11 @@ def main():
             ("theta' (METAMON)", tname, os.path.join(h4, "theta_prime.safetensors"), "trained")]
     for n, info in man["locals"].items():
         arms.append((f"Local {short(n)} + LoRD", n, info["delta"], "trained"))
+    extra = []
+    for e in a.extra:
+        lab, _, pth = e.partition("=")
+        extra.append((lab.strip(), tname, pth.strip(), "trained"))
+    arms = extra if a.only_extra else arms + extra
 
     hyp_path = os.path.join(a.out, "hyps.json")
     hyps = json.load(open(hyp_path, encoding="utf-8")) if os.path.exists(hyp_path) else {}

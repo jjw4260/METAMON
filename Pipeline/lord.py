@@ -197,6 +197,21 @@ def lord_loss(lp_pos, m_pos, lp_neg, m_neg, lp_vic, m_vic,
 
 
 # ---------------------------------------------------------------- 학습
+def make_optimizer(params, lr: float, kind: str = "adamw"):
+    """기본은 fp32 AdamW. 7B 이상 단일 모델은 상태를 8-bit 로 줄여 80GB 에 맞춘다."""
+    if kind == "adamw":
+        return torch.optim.AdamW(params, lr=lr, foreach=True)
+    try:
+        import bitsandbytes as bnb
+    except ImportError as e:
+        raise SystemExit("optim 이 8-bit 이면 bitsandbytes 가 필요하다: pip install bitsandbytes") from e
+    if kind == "adamw8bit":
+        return bnb.optim.AdamW8bit(params, lr=lr)
+    if kind == "paged_adamw8bit":
+        return bnb.optim.PagedAdamW8bit(params, lr=lr)
+    raise SystemExit(f"알 수 없는 optim: {kind}")
+
+
 def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
                data: Sequence[dict], seed: int,
                health: Optional[Callable[[], float]] = None,
@@ -215,7 +230,7 @@ def train_lord(ws: WeightSpace, tok, cfg: Config, name: str,
     pad = tok.pad_token_id
     ws.reset()
     ws.trainable(True)
-    opt = torch.optim.AdamW(ws.params, lr=cfg.lord_lr, foreach=True)
+    opt = make_optimizer(ws.params, cfg.lord_lr, getattr(cfg, "optim", "adamw"))
     jl = open(os.path.join(cfg.log_dir, f"{name}.jsonl"), "a", encoding="utf-8")
     upd = 0
     prev_p: Dict[int, Tuple[float, float]] = {}

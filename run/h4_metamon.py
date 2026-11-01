@@ -110,6 +110,7 @@ def main():
     a = ap.parse_args()
     root = os.path.dirname(a.manifest)
     a.out = a.out or os.path.join(root, "h4", a.plan)
+    custom_recipe = a.recipe is not None          # ablation recipe 면 h3b 재현 검사를 하지 않는다
     a.recipe = a.recipe or os.path.join(root, "h3", a.plan, "select_check.json")
     os.makedirs(a.out, exist_ok=True)
     os.makedirs(a.local_dir, exist_ok=True)
@@ -193,7 +194,7 @@ def main():
     del A_main
     torch.cuda.empty_cache()
     rc = os.path.join(root, "h3", a.plan, "report_check.json")
-    if os.path.exists(rc):
+    if os.path.exists(rc) and not custom_recipe:
         g = json.load(open(rc, encoding="utf-8"))
         ref = [r for r in g["grid"] if r["omega"] == g["chosen"]["omega"] and r["A"] == g["chosen"]["A"]]
         if ref:
