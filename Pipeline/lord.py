@@ -201,6 +201,12 @@ def make_optimizer(params, lr: float, kind: str = "adamw"):
     """기본은 fp32 AdamW. 7B 이상 단일 모델은 상태를 8-bit 로 줄여 80GB 에 맞춘다."""
     if kind == "adamw":
         return torch.optim.AdamW(params, lr=lr, foreach=True)
+    if kind == "adafactor":
+        # 2차 모멘트를 행·열로 분해하고 1차 모멘트를 두지 않아 상태가 거의 0 이다.
+        # 7B fp32 학습 (가중치 30GB + 기울기 26GB) 을 80GB 에 맞추는 용도.
+        from transformers.optimization import Adafactor
+        return Adafactor(params, lr=lr, scale_parameter=False, relative_step=False,
+                         warmup_init=False, beta1=None, weight_decay=0.0)
     try:
         import bitsandbytes as bnb
     except ImportError as e:

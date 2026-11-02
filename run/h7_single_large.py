@@ -7,7 +7,8 @@
 질의 예산을 맞춘다. METAMON 의 공격자 쪽은 theta (X_theta 1024) 와 Local 3 개
 (각 1024) 로 Target 에 모두 4096 번 질의했다. 단일 대형 Local 은 같은 4096 질의
 (train 전체) 로 학습한다. 학습 설정은 h1 과 같다 (LoRD-VI, lord_lr, EOS, sel 최적 시점).
-7B 이상은 fp32 AdamW 상태가 80GB 를 넘으므로 --optim paged_adamw8bit 로 상태만 8-bit 로 둔다.
+7B 이상은 fp32 가중치 (30GB) 와 기울기 (26GB) 만으로 80GB 의 대부분을 쓰므로 AdamW 상태를 둘 자리가
+없다 (8-bit 상태로도 OOM). 기본은 상태가 거의 없는 Adafactor (--optim adafactor) 로 학습한다.
 
 보고 (out/)
   test 512 의 L, avgBF (자기 tokenizer), test 앞 256 생성의 BLEU-4 / ROUGE-L / BERTScore
@@ -58,7 +59,7 @@ def main():
     ap.add_argument("--metamon", required=True, help="METAMON run 폴더 (manifest.json, h5/<plan>/hyps.json)")
     ap.add_argument("--plan", default="ot")
     ap.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    ap.add_argument("--optim", default="paged_adamw8bit", choices=["adamw", "adamw8bit", "paged_adamw8bit"])
+    ap.add_argument("--optim", default="adafactor", choices=["adamw", "adamw8bit", "paged_adamw8bit", "adafactor"])
     ap.add_argument("--lord-micro", type=int, default=2)
     ap.add_argument("--local-dir", default="/content/hetero_local/h7")
     ap.add_argument("--n-x", type=int, default=4096)
