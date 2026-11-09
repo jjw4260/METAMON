@@ -49,7 +49,7 @@ def main() -> None:
                     help="새로 보낼 질의 상한. 캐시 적중은 세지 않는다")
     ap.add_argument("--subset", default="cs-en")
     ap.add_argument("--task", default="",
-                    help="비우면 WMT16 번역 (--subset). e2e_nlg / wikisql / samsum / piqa / saferlhf")
+                    help="비우면 WMT16 번역 (--subset). e2e_nlg / wikisql / samsum / piqa / saferlhf / diasafety")
     ap.add_argument("--pool", type=int, default=None,
                     help="훑을 WMT train 문장 수. 프롬프트 길이 필터 (max_prompt_tok) 를 넘는 문장이 "
                          "많은 언어쌍 (ru, fi 등) 은 기본 8192 로는 4992 질의가 안 모인다")

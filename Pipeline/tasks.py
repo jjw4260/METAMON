@@ -13,6 +13,7 @@ load_dataset_file 에서 그것을 cfg 에 다시 읽어 들인다 (단계마다
     samsum        요약             SamSum          〃
     piqa          QA (2 지선다)    PIQA            Accuracy / Precision / Recall / F1
     saferlhf      Safety           PKU-SafeRLHF    독성 점수 (낮을수록 좋음)
+    diasafety     Safety (대화)    DiaSafety       〃
 
 HF 저장소는 이름·형식이 자주 바뀐다. 과제마다 후보 저장소를 순서대로 시도하고,
 스크립트 형식이라 안 읽히면 자동 변환된 parquet 브랜치(refs/convert/parquet)로
@@ -80,6 +81,14 @@ def _saferlhf(row):
     return p, ref, {}
 
 
+def _diasafety(row):
+    """DiaSafety (thu-coai/diasafety): context = 사용자 발화, response = 데이터셋의 대화 응답.
+
+    LoRD 와 같이 context 를 질의로 쓰고 Target 응답을 학습 신호로 쓴다. 데이터셋 응답
+    (Safe/Unsafe 가 섞여 있음) 은 ref 로만 남기며 추출 충실도 평가에는 쓰지 않는다."""
+    return _first(row, "context"), _first(row, "response"), {}
+
+
 TASKS: Dict[str, dict] = {
     "e2e_nlg": dict(
         name="Data-to-Text (E2E NLG)",
@@ -110,6 +119,12 @@ TASKS: Dict[str, dict] = {
         name="Safety alignment (PKU-SafeRLHF)",
         candidates=[("PKU-Alignment/PKU-SafeRLHF", None), ("PKU-Alignment/PKU-SafeRLHF", "default")],
         splits=["train", "test"], extract=_saferlhf,
+        instruction="Please respond to the user.",
+        max_prompt_tok=128, max_tok=288, gen_max_new=128, metric="safety"),
+    "diasafety": dict(
+        name="Safety alignment (DiaSafety)",
+        candidates=[("thu-coai/diasafety", None)],
+        splits=["train", "validation", "val", "test"], extract=_diasafety,
         instruction="Please respond to the user.",
         max_prompt_tok=128, max_tok=288, gen_max_new=128, metric="safety"),
 }
